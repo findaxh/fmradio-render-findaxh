@@ -181,7 +181,13 @@ function playSegment(i) {
   }
   segIndex = i;
   var seg = playlist[i];
-  video.src = seg.url;
+  // HTTPS 页面无法播放 http 媒体（浏览器混合内容拦截），统一升级。
+  // 服务端已升级，这里兜底处理缓存里的旧数据或个别漏网页面。
+  var u = seg.url;
+  if (location.protocol === "https:" && u.indexOf("http://") === 0) {
+    u = "https://" + u.slice(7);
+  }
+  video.src = u;
   var p = video.play();
   if (p && p.catch) p.catch(function () { setStatus("请点击播放器中的播放按钮"); });
   if (playlist.length > 1) {

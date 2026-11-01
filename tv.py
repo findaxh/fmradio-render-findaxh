@@ -588,6 +588,33 @@ def _natkey(s):
     return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s or "")]
 
 
+# ---------------------------------------------------------------------------
+# 频道白名单：只保留「央视频道 + 省级卫视（每省/直辖市一个）」。
+# 全量聚合有 800+ 频道、数千个地址，打开页面逐个探测要等很久；
+# 白名单把频道收敛到 ~50 个，探测十几秒内完成。设环境变量 TV_FULL=1 恢复全量。
+# ---------------------------------------------------------------------------
+TV_FULL = os.environ.get("TV_FULL", "0") == "1"
+
+_TV_WHITELIST = set()
+for _k in _CCTV_NAMES:                    # cctv-1 … cctv-17 / 4k / 8k / 5+
+    _TV_WHITELIST.add("CCTV-" + _k.split("-", 1)[1].upper())
+_TV_WHITELIST.add("CGTN")                 # 央视国际（总台）
+for _n in (
+    # 直辖市
+    "北京卫视", "天津卫视", "上海→东方卫视", "重庆卫视",
+    # 省（含自治区的官方卫视名）
+    "河北卫视", "山西卫视", "内蒙古卫视", "辽宁卫视", "吉林卫视",
+    "黑龙江卫视", "东方卫视", "江苏卫视", "浙江卫视", "安徽卫视",
+    "东南卫视",                               # 福建（对外统一呼号）
+    "江西卫视", "山东卫视", "河南卫视", "湖北卫视", "湖南卫视",
+    "广东卫视", "广西卫视", "海南卫视", "四川卫视", "贵州卫视",
+    "云南卫视", "西藏卫视", "陕西卫视", "甘肃卫视",
+    "青海卫视", "宁夏卫视", "新疆卫视",
+):
+    if "→" not in _n:
+        _TV_WHITELIST.add(_n)
+
+
 def _snapshot(payload):
     """把缓存里的 payload 复制一份再返回。
 
@@ -657,13 +684,26 @@ def get_channels(force=False, probe=False, refresh=False):
                 if not c["logo"] and ch["logo"]:
                     c["logo"] = ch["logo"]
 
+        # 白名单过滤：只保留央视 + 省级卫视（TV_FULL=1 关闭）
+        if not TV_FULL:
+            merged = {k: v for k, v in merged.items() if k in _TV_WHITELIST}
+            order = [k for k in order if k in _TV_WHITELIST]
+
         channels = []
         for k in order:
             c = merged[k]
             urls = c["urls"][:MAX_URLS_PER_CHANNEL]
+            # 卫视类显示名规范成白名单名（去掉源里的 4K/高清 等后缀噪音）；
+            # 央视保留 _CCTV_NAMES 的完整中文名（如「CCTV-1 综合」）
+            disp = c["name"]
+            if (
+                not TV_FULL and k in _TV_WHITELIST
+                and not k.startswith("CCTV") and not k.startswith("CGTN")
+            ):
+                disp = k
             channels.append(
                 {
-                    "name": c["name"],
+                    "name": disp,
                     "raw_name": c["raw_name"],
                     "logo": c["logo"],
                     "cats": c["cats"],
@@ -961,6 +1001,10 @@ def _cctv_video(page_url):
         u = (c.get("url") or "").strip()
         if not u:
             continue
+        # HTTPS 页面无法播放 http 媒体（混合内容拦截）。实测 vod.cntv.lxdns.com
+        # 的 https 端口正常，统一升级，保证云端 HTTPS 部署也能播。
+        if u.startswith("http://"):
+            u = "https://" + u[len("http://"):]
         try:
             dur = float(c.get("duration") or 0)
         except (TypeError, ValueError):

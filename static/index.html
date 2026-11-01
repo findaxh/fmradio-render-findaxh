@@ -33,6 +33,7 @@
       </select>
       <input id="search" type="search" placeholder="搜索电台名/关键词…" autocomplete="off" />
       <button id="testBtn" class="test-btn" title="检测当前电台源是否存活">检测源</button>
+      <button id="blockedBtn" class="test-btn" title="查看/恢复已屏蔽的电台">已屏蔽(0)</button>
     </div>
     <div class="chips-label">区域</div>
     <div id="regionChips" class="chips"></div>
@@ -46,7 +47,10 @@
     <button id="playBtn" class="play-btn" aria-label="播放/暂停">▶</button>
     <div class="now">
       <div class="now-name" id="nowName">未选择电台</div>
-      <div class="now-status" id="nowStatus">加载中…</div>
+      <div class="now-status-row">
+        <span class="now-status" id="nowStatus">加载中…</span>
+        <button id="blockBtn" class="block-btn" style="display:none" title="此源经常播放失败时，从列表中屏蔽它">屏蔽此台</button>
+      </div>
     </div>
     <div class="vol">
       <span>🔊</span>

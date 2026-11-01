@@ -11,12 +11,54 @@ const nowName = document.getElementById("nowName");
 const nowStatus = document.getElementById("nowStatus");
 const volumeEl = document.getElementById("volume");
 const testBtn = document.getElementById("testBtn");
+const blockBtn = document.getElementById("blockBtn");
+const blockedBtn = document.getElementById("blockedBtn");
 
 let stations = [];        // 当前加载的全部电台
 let currentRegion = "全部";
 let currentCat = "全部";
 let currentStation = null;
 let currentHls = null;
+
+// ---------- 屏蔽名单（localStorage 持久化） ----------
+// HLS 电台被浏览器 CORS 拦截或源失效是持续性的，屏蔽后不再出现在列表里。
+const BLOCK_KEY = "fm_blocked_stations";
+let blocked = new Set();
+try { blocked = new Set(JSON.parse(localStorage.getItem(BLOCK_KEY) || "[]")); } catch (e) {}
+let showBlocked = false;
+
+function saveBlocked() {
+  try { localStorage.setItem(BLOCK_KEY, JSON.stringify([...blocked])); } catch (e) {}
+  blockedBtn.textContent = "已屏蔽(" + blocked.size + ")";
+}
+function isBlocked(st) { return blocked.has(st.url); }
+function toggleBlock(st) {
+  if (!st) return;
+  if (blocked.has(st.url)) {
+    blocked.delete(st.url);
+    setStatus("已恢复「" + (st.name || "") + "」");
+  } else {
+    blocked.add(st.url);
+    setStatus("已屏蔽「" + (st.name || "") + "」，点「已屏蔽」可恢复");
+    if (currentStation && currentStation.url === st.url) {
+      try { audio.pause(); } catch (e) {}
+      destroyHls();
+      currentStation = null;
+      nowName.textContent = "未选择电台";
+    }
+  }
+  saveBlocked();
+  renderStations();
+}
+function showBlockAction() { blockBtn.style.display = ""; }
+function hideBlockAction() { blockBtn.style.display = "none"; }
+blockBtn.addEventListener("click", () => toggleBlock(currentStation));
+blockedBtn.addEventListener("click", () => {
+  showBlocked = !showBlocked;
+  blockedBtn.classList.toggle("active", showBlocked);
+  renderStations();
+});
+saveBlocked();
 
 audio.volume = parseFloat(volumeEl.value);
 volumeEl.addEventListener("input", () => { audio.volume = parseFloat(volumeEl.value); });
@@ -94,6 +136,8 @@ function renderChips() {
 function getFiltered() {
   const kw = searchEl.value.trim().toLowerCase();
   return stations.filter((s) => {
+    // 屏蔽视图只显示被屏蔽的电台；正常视图过滤掉它们
+    if (showBlocked !== isBlocked(s)) return false;
     if (currentRegion !== "全部" && s.region !== currentRegion) return false;
     if (currentCat !== "全部" && !(s.cats || []).includes(currentCat)) return false;
     if (kw) {
@@ -108,7 +152,9 @@ function renderStations() {
   const list = getFiltered();
   stationListEl.innerHTML = "";
   if (!list.length) {
-    stationListEl.innerHTML = '<div class="empty">没有匹配的电台</div>';
+    stationListEl.innerHTML = showBlocked
+      ? '<div class="empty">没有被屏蔽的电台</div>'
+      : '<div class="empty">没有匹配的电台</div>';
     return;
   }
   list.forEach((st) => {
@@ -133,6 +179,13 @@ function renderStations() {
     meta.appendChild(sub);
     el.appendChild(ic);
     el.appendChild(meta);
+    // 屏蔽/恢复按钮：正常视图 ✕ 屏蔽，屏蔽视图 ♻ 恢复
+    const bx = document.createElement("div");
+    bx.className = "block-x";
+    bx.title = showBlocked ? "恢复此台" : "屏蔽此台（不再显示）";
+    bx.textContent = showBlocked ? "♻" : "✕";
+    bx.onclick = (ev) => { ev.stopPropagation(); toggleBlock(st); };
+    el.appendChild(bx);
     el.onclick = () => playStation(st);
     stationListEl.appendChild(el);
   });
@@ -164,6 +217,7 @@ function playStation(st) {
   currentStation = st;
   nowName.textContent = st.name || "(未命名)";
   setStatus("正在连接…");
+  hideBlockAction();
   renderStations();
   destroyHls();
 
@@ -175,7 +229,10 @@ function playStation(st) {
       hls.attachMedia(audio);
       hls.on(Hls.Events.MANIFEST_PARSED, () => audio.play().catch(() => {}));
       hls.on(Hls.Events.ERROR, (evt, data) => {
-        if (data.fatal) setStatus("HLS 播放失败：可能被浏览器 CORS 拦截或源失效");
+        if (data.fatal) {
+          setStatus("HLS 播放失败：可能被浏览器 CORS 拦截或源失效");
+          showBlockAction();
+        }
       });
     } else if (audio.canPlayType("application/vnd.apple.mpegurl")) {
       audio.src = st.url;
@@ -185,7 +242,7 @@ function playStation(st) {
     }
   } else {
     audio.src = st.url;
-    audio.play().catch(() => setStatus("播放失败：源失效或无法直连"));
+    audio.play().catch(() => { setStatus("播放失败：源失效或无法直连"); showBlockAction(); });
   }
 }
 
@@ -199,10 +256,10 @@ playBtn.addEventListener("click", () => {
   else audio.pause();
 });
 
-audio.addEventListener("playing", () => { setStatus("● 播放中"); refreshIcons(); playBtn.textContent = "❚❚"; });
+audio.addEventListener("playing", () => { setStatus("● 播放中"); hideBlockAction(); refreshIcons(); playBtn.textContent = "❚❚"; });
 audio.addEventListener("waiting", () => setStatus("缓冲中…"));
 audio.addEventListener("pause", () => { setStatus("已暂停"); refreshIcons(); playBtn.textContent = "▶"; });
-audio.addEventListener("error", () => { if (currentStation) setStatus("播放出错：源失效或被拦截"); });
+audio.addEventListener("error", () => { if (currentStation) { setStatus("播放出错：源失效或被拦截"); showBlockAction(); } });
 
 // ---------- 检测源（服务器侧存活） ----------
 testBtn.addEventListener("click", () => {

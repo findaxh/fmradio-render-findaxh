@@ -20,7 +20,7 @@ A web-based FM radio player. Station data comes from the open-source [Radio Brow
 | --- | --- |
 | 📻 电台 | 多国家在线 FM 电台（Radio Browser 索引），区域 + 类别筛选 |
 | 📺 电视频道 | 多源聚合的公开 TV 直播（569 个频道），打开即自动测活、只显示可播放的，分类标签 + 台标预览 + 按名称排序 |
-| 🎬 视频节目 | 《新闻联播》（近 30 天，每日完整版 + 当日分条）、《北京新闻》（近 20 期），左侧播放器 + 右侧列表，均可页内播放 |
+| 🎬 视频节目 | 《新闻联播》（近 30 天，每日完整版 + 当日分条）、《北京新闻》（近 20 期），左侧播放器 + 右侧列表，均可页内播放（央视分片地址已升级 HTTPS，云端部署可正常播放） |
 
 - 🌍 **多国家/地区**：中国、全球、美国、日本、英国、韩国
 - 🏷️ **自动分类标签**：区域（中央台 / 北京 / 江苏 / 山东 …）+ 类别（新闻 / 交通 / 音乐 / 财经 / 体育 …）
@@ -31,6 +31,7 @@ A web-based FM radio player. Station data comes from the open-source [Radio Brow
 - 🔧 **后台守护 + 开机自启**：一条命令后台启动/停止/重启/查状态/看日志；Linux 支持 `./run.sh enable` 一键注册 systemd 开机自启
 - 📱 **响应式布局**：自适应桌面与手机浏览器（平板/手机/小屏手机三档断点）；分类标签在手机上为单行横向滚动
 - 🛡️ **直播源容错**：多源聚合 + 服务侧死链检测 + 播放端自动切换备用源
+- 🚫 **电台屏蔽**：播放失败（CORS 拦截/源失效）的电台可一键屏蔽并存入本地黑名单，支持恢复
 
 ## 🚀 快速开始 / Quick Start
 
@@ -171,6 +172,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now fmradio
 | 出网方式    | **纯直连（默认）**：`RB_PROXY_MODE=direct`，完全忽略系统代理与 `HTTP(S)_PROXY` 环境变量，不使用 Clash Verge 等任何代理。仅在特殊网络下才改为 `system`（只走代理）或 `auto`（直连失败回退代理） |
 | 超时 / 缓存 | `RB_TIMEOUT`（默认 8s）、`RB_DEADLINE`（每通道时限 30s）、`RB_CACHE_TTL`（结果缓存 300s） |
 | TV 频道源 | `TV_SOURCES`，逗号分隔，默认 6 个源（Collect-IPTV 每 4 小时自动测活优选 + gh-proxy 镜像、vbskycn 6 小时拨测、peterhchina 两个、iptv-org）。同一频道跨源合并为多个备用源，不可达的源自动跳过 |
+| 频道白名单 | 默认只保留**央视 + 省级卫视**（每省/直辖市一个，共 ~48 个），探测耗时从分钟级降到十几秒；设 `TV_FULL=1` 恢复全量 |
 | TV/节目缓存 | `TV_TIMEOUT`（默认 15s）、`TV_CACHE_TTL`（默认 1800s）、`TV_SOURCES_DEADLINE`（拉取全部源的总时限，默认 45s） |
 | 死链检测 | `TV_PROBE_TTL`（600s）、`TV_PROBE_WORKERS`（48）、`TV_PROBE_TIMEOUT`（4s）、`TV_MAX_URLS`（每频道最多备用源 6）；打开页面自动全量探测，`↻ 刷新可用频道` 按钮强制重测 |
 | 联播往期天数 | `XWLB_DAYS`（默认 30） |
