@@ -14,13 +14,12 @@ A web-based FM radio player. Station data comes from the open-source [Radio Brow
 
 ## ✨ 功能特性 / Features
 
-三个板块，顶部导航一键切换：
+两个板块，顶部导航一键切换：
 
 | 板块 | 内容 |
 | --- | --- |
 | 📻 电台 | 多国家在线 FM 电台（Radio Browser 索引），区域 + 类别筛选 |
-| 📺 电视频道 | 多源聚合的公开 TV 直播（569 个频道），打开即自动测活、只显示可播放的，分类标签 + 台标预览 + 按名称排序 |
-| 🎬 视频节目 | 《新闻联播》（近 30 天，每日完整版 + 当日分条）、《北京新闻》（近 20 期），左侧播放器 + 右侧列表，均可页内播放（央视分片地址已升级 HTTPS，云端部署可正常播放） |
+| 🎬 视频节目 | 《新闻联播》（近 30 天，每日完整版 + 当日分条）、《北京新闻》（近 20 期），左侧播放器 + 右侧列表，均可页内播放；支持清晰度切换与自动升/降档（流畅 418K ～ 超清 2M） |
 
 - 🌍 **多国家/地区**：中国、全球、美国、日本、英国、韩国
 - 🏷️ **自动分类标签**：区域（中央台 / 北京 / 江苏 / 山东 …）+ 类别（新闻 / 交通 / 音乐 / 财经 / 体育 …）
@@ -30,7 +29,7 @@ A web-based FM radio player. Station data comes from the open-source [Radio Brow
 - 🖥️ **跨平台部署**：Windows 与 Ubuntu 均可；支持通过 frp 从公网访问（可选，本地使用无需配置）
 - 🔧 **后台守护 + 开机自启**：一条命令后台启动/停止/重启/查状态/看日志；Linux 支持 `./run.sh enable` 一键注册 systemd 开机自启
 - 📱 **响应式布局**：自适应桌面与手机浏览器（平板/手机/小屏手机三档断点）；分类标签在手机上为单行横向滚动
-- 🛡️ **直播源容错**：多源聚合 + 服务侧死链检测 + 播放端自动切换备用源
+- 🛡️ **直播源容错**：多档码率变体 + 播放失败自动切换（https 直连优先，服务器代理兜底）
 - 🚫 **电台屏蔽**：播放失败（CORS 拦截/源失效）的电台可一键屏蔽并存入本地黑名单，支持恢复
 
 ## 🚀 快速开始 / Quick Start
@@ -109,10 +108,10 @@ PORT=9000 ./run.sh                                       # 改端口
 
 要点与限制：
 
-- **生产 WSGI**：Render 上用 `gunicorn`（gthread worker）运行，SSE 流式接口（`/api/tv/channels/stream`）依赖 gthread 的线程并发，不能换 sync worker。
+- **生产 WSGI**：Render 上用 `gunicorn`（gthread worker）运行，保证流式响应并发，不要换 sync worker。
 - **免费档休眠**：free plan 15 分钟无流量会休眠，首次唤醒约需 30–50 秒；升级 starter 可常驻。
 - **磁盘为临时盘**：重启后文件系统清空；本项目缓存全在内存，无影响。
-- **混合内容与 CORS（直连优先 + 代理兜底）**：Render 页面是 HTTPS，而多数电视/央视源是 `http://`，浏览器会拦截；HLS 源还常缺 CORS 头。播放地址展开为「https 直连优先 + `/api/tv/media` 同源代理兜底」候选列表：直连不经服务器、最流畅，直连失败时前端自动切换到代理（详见「配置」表 `TV_PROXY_MEDIA`）。电台播放仍为浏览器直连，失效台可用屏蔽功能隐藏。
+- **混合内容与 CORS（直连优先 + 代理兜底）**：Render 页面是 HTTPS，而央视解析出的部分分片是 `http://`，浏览器会拦截。已统一升级 https 直连（不经服务器，最流畅）；直连失败时前端自动切换到 `/api/tv/media` 同源代理兜底（详见「配置」表 `TV_PROXY_MEDIA`）。电台播放为浏览器直连，失效台可用屏蔽功能隐藏。
 - 出站网络：Render 服务器在海外，访问 Radio Browser / GitHub 源列表很通畅；国内服务器的 gh-proxy 超时问题不存在。
 
 ### 通过 frp 公网访问（可选，本地不部署也可以正常使用）/ Public access via frp (optional)
@@ -171,46 +170,25 @@ sudo systemctl daemon-reload && sudo systemctl enable --now fmradio
 | 播放模式    | 直连（浏览器直接连接电台源站）                                                                                                                     |
 | 出网方式    | **纯直连（默认）**：`RB_PROXY_MODE=direct`，完全忽略系统代理与 `HTTP(S)_PROXY` 环境变量，不使用 Clash Verge 等任何代理。仅在特殊网络下才改为 `system`（只走代理）或 `auto`（直连失败回退代理） |
 | 超时 / 缓存 | `RB_TIMEOUT`（默认 8s）、`RB_DEADLINE`（每通道时限 30s）、`RB_CACHE_TTL`（结果缓存 300s） |
-| TV 频道源 | `TV_SOURCES`，逗号分隔，默认 6 个源（Collect-IPTV 每 4 小时自动测活优选 + gh-proxy 镜像、vbskycn 6 小时拨测、peterhchina 两个、iptv-org）。同一频道跨源合并为多个备用源，不可达的源自动跳过 |
-| 频道白名单 | 默认只保留**央视 + 省级卫视**（每省/直辖市一个，共 ~48 个），探测耗时从分钟级降到十几秒；设 `TV_FULL=1` 恢复全量 |
-| 媒体代理 | `TV_PROXY_MEDIA`（默认 1）：播放地址展开为「**https 直连优先 + 同源代理兜底**」候选列表——直连不经服务器、最流畅；直连被混合内容/CORS 拦截时前端自动切换到 `/api/tv/media` 代理（支持 Range 拖动与 m3u8 嵌套重写）。设 `0` 完全关闭代理兜底 |
-| TV/节目缓存 | `TV_TIMEOUT`（默认 15s）、`TV_CACHE_TTL`（默认 1800s）、`TV_SOURCES_DEADLINE`（拉取全部源的总时限，默认 45s） |
-| 死链检测 | `TV_PROBE_TTL`（600s）、`TV_PROBE_WORKERS`（48）、`TV_PROBE_TIMEOUT`（4s）、`TV_MAX_URLS`（每频道最多备用源 6）；打开页面自动全量探测，`↻ 刷新可用频道` 按钮强制重测 |
+| 媒体代理 | `TV_PROXY_MEDIA`（默认 1）：央视视频播放失败（直连被混合内容/CORS 拦截）时，前端自动切换到 `/api/tv/media` 同源代理兜底（支持 Range 拖动）。设 `0` 完全关闭代理兜底 |
+| 节目超时/缓存 | `TV_TIMEOUT`（默认 15s）、`TV_CACHE_TTL`（节目与解析结果缓存，默认 1800s） |
 | 联播往期天数 | `XWLB_DAYS`（默认 30） |
-
-### 电视频道：打开即测活，只显示可播放的
-
-公开直播源失效是常态，本项目从五个层面解决：
-
-1. **多源聚合**：默认 6 个公开列表，同一频道按归一化名合并，最多保留 `TV_MAX_URLS`（6）个备用地址
-2. **打开即自动测活**：进入 `/tv` 时通过 SSE 流式接口并发探测每个频道的所有备用源，**列表只渲染可连接的频道**，进度条实时显示「正在测试频道连接 x/y」
-3. **结果缓存 + 单飞**：探测结果缓存 `TV_PROBE_TTL`（默认 10 分钟），期间刷新页面 **0.5 秒**出列表；多人同时打开时后来者直接命中缓存，不会把探测线程按用户数翻倍
-4. **播放端自动切换**：某个源播放失败时自动切到下一个备用源，状态栏显示「主源失效，切换到备用源 n/m」；浏览器拦截自动播放时不会误判为源失效
-5. **总时限保护**：所有源都不可达时，`TV_SOURCES_DEADLINE` 保证 SSE 在 45 秒内给出明确错误，不会无限挂住
-
-实测：842 个频道中 **718 个可播放**，124 个连不上的被自动过滤。
-
-> 部署提示：默认源里 `raw.githubusercontent.com` 在国内服务器经常读取超时，已配 gh-proxy 镜像兜底（实测超时后仍能拿到全部频道）。若部署机访问 GitHub 系列全部不通，可用 `TV_SOURCES` 换成国内可达的 m3u 地址。
 
 ### 数据源 / Data sources
 
 - 电台索引：[Radio Browser](https://api.radio-browser.info)（社区维护，无 API key）
-- 电视频道：[vbskycn/iptv](https://github.com/vbskycn/iptv)（6 小时自动拨测）、[peterhchina/iptv](https://github.com/peterhchina/iptv)（每日更新）、[iptv-org](https://github.com/iptv-org/iptv)（全球）
 - 《新闻联播》：央视网 <https://tv.cctv.com/lm/xwlb/index.shtml>，往期页 `tv.cctv.com/lm/xwlb/day/YYYYMMDD.shtml`，播放地址经 `vdn.apps.cntv.cn` 解析
 - 《北京新闻》：北京时间 <https://www.btime.com/btv/btvxw_bjxm>，播放地址经 `app.api.btime.com/video/play` 解析
 
 本项目仅做聚合与界面呈现，不存储、不分发任何音视频内容，播放全部走浏览器直连原始来源。
-源失效时可通过 `TV_SOURCES` 或上述官方页面自行增删。
 
 ### API 一览 / Endpoints
 
 | 端点 | 说明 |
 | --- | --- |
-| `GET /` `GET /tv` `GET /programs` | 三个页面 |
+| `GET /` `GET /programs` | 两个页面 |
 | `GET /api/radiobrowser?country=CN&limit=300` | 电台列表（去重 + 自动标签） |
 | `GET /api/probe?url=<流地址>` | 服务器侧检测流是否存活 |
-| `GET /api/tv/channels` | 电视频道列表（含台标、分类、多备用源） |
-| `GET /api/tv/channels?probe=1` | 同上，附带死链检测结果与延迟 |
 | `GET /api/tv/programs?src=xwlb\|bjxw` | 节目列表；`xwlb` 支持 `&date=YYYY-MM-DD` 取往期 |
 | `GET /api/tv/play?url=<节目详情页>[&gid=]` | 解析节目可直接播放的媒体地址 |
 | `GET /healthz` | 健康检查 |
@@ -245,19 +223,18 @@ has no effect. Set `RB_PROXY_MODE=system` only if the host can reach the interne
 
 ```
 .
-├── app.py               # Flask 后端：页面 + 电台/TV/节目 API
-├── tv.py                # TV 频道(m3u) 与节目(央视/北京时间) 聚合解析
+├── app.py               # Flask 后端：页面 + 电台/节目 API + 同源媒体代理
+├── tv.py                # 视频节目聚合解析（新闻联播 / 北京新闻，多码率变体）
 ├── tagging.py           # 电台区域/类别标签推导 + 名称归一化（去重）
 ├── proxy_utils.py       # URL 校验与 SSRF 防护
 ├── requirements.txt     # Python 依赖（Flask, requests）
 ├── static/
 │   ├── index.html       # 📻 电台页
-│   ├── tv.html          # 📺 电视频道页（分类标签 + 台标预览）
 │   ├── programs.html    # 🎬 视频节目页（新闻联播 / 北京新闻）
 │   ├── style.css        # 全部样式（含响应式断点）
 │   ├── app.js           # 电台页逻辑
-│   ├── tv.js            # 电视频道页逻辑
-│   └── programs.js      # 视频节目页逻辑
+│   ├── player.js        # 播放器增强（后台播放 / 全屏横屏 / 画中画）
+│   └── programs.js      # 视频节目页逻辑（清晰度切换 + 自动升/降档）
 ├── render.yaml          # Render Blueprint（一键部署配置）
 ├── run.bat              # Windows 启动脚本（默认后台；start/stop/restart/status/logs/run）
 ├── run.sh               # Ubuntu/Linux 启动脚本（默认后台 + stop/restart/status/logs/run/enable/disable）
@@ -268,7 +245,7 @@ has no effect. Set `RB_PROXY_MODE=system` only if the host can reach the interne
 
 ## 🛠️ 技术栈 / Tech Stack
 
-Python · Flask · requests · hls.js · Radio Browser API · iptv-org
+Python · Flask · requests · hls.js · Radio Browser API
 
 ## 📄 License / 协议
 

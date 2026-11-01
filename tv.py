@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""电视频道 + 视频节目聚合（纯标准库 + requests）。
+"""视频节目聚合（纯标准库 + requests）。
 
 数据源：
-- TV 频道：多个公开 m3u 列表（vbskycn 6 小时自动拨测 / peterhchina 每日更新等），
-  同一频道聚合多个备用源，播放失败自动切换
-- 视频节目：央视《新闻联播》(tv.cctv.com/lm/xwlb) 与 BTV《北京新闻》(btime.com)
+- 央视《新闻联播》(tv.cctv.com/lm/xwlb)：近 30 天往期 + 当日分条，多码率变体
+- BTV《北京新闻》(btime.com)：多路码率流
 
 与 app.py 的网络策略保持一致：默认纯直连，不使用任何系统/环境代理。
 """
-import json
 import os
 import re
 import threading
@@ -22,36 +20,6 @@ UA_BROWSER = (
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-# 默认 TV 源（按优先级排列，可用环境变量 TV_SOURCES 覆盖，逗号分隔）
-#   1. zilong7728/Collect-IPTV：每 4 小时自动更新，自带可用性检测 + 低延迟优选
-#      （best_sorted.m3u，447 个频道全带台标；raw 不通时自动走 gh-proxy / jsDelivr 镜像）
-#   2. vbskycn/iptv：后台每 6 小时自动测速拨测，剔除死链，带台标 + EPG
-#   3. peterhchina/iptv：每日更新，央视 + 卫视 + 地方
-#   4. peterhchina 央视频道专表
-#   5. iptv-org 全球公开列表（补充海外台）
-_CI = "https://raw.githubusercontent.com/zilong7728/Collect-IPTV/refs/heads/main/best_sorted.m3u"
-TV_SOURCES = [
-    u.strip()
-    for u in os.environ.get(
-        "TV_SOURCES",
-        ",".join(
-            [
-                _CI,
-                "https://gh-proxy.com/https://raw.githubusercontent.com/zilong7728/Collect-IPTV/refs/heads/main/best_sorted.m3u",
-                "https://live.zbds.top/tv/iptv4.m3u",
-                "https://peterhchina.github.io/iptv/CNTV-V4.m3u",
-                "https://peterhchina.github.io/iptv/CCTV-V4.m3u",
-                "https://iptv-org.github.io/iptv/countries/cn.m3u",
-                # fanmingming/live：每日更新的直连源（海外可达，域名双保险）
-                "https://live.fanmingming.com/tv/m3u/global.m3u",
-                "https://live.fanmingming.cn/tv/m3u/global.m3u",
-            ]
-        ),
-    ).split(",")
-    if u.strip()
-]
-
-MAX_URLS_PER_CHANNEL = int(os.environ.get("TV_MAX_URLS", "6"))
 TV_TIMEOUT = float(os.environ.get("TV_TIMEOUT", "15"))
 TV_CACHE_TTL = float(os.environ.get("TV_CACHE_TTL", "1800"))
 
@@ -72,17 +40,6 @@ XWLB_DAYS = int(os.environ.get("XWLB_DAYS", "30"))   # 侧栏展示的往期天�
 _CACHE = {}
 _LOCK = threading.Lock()
 
-# 源存活探测缓存：url -> (ts, ok, latency_ms)
-_PROBE_CACHE = {}
-# 串行化真正的探测：避免多人同时打开页面时线程数按用户数翻倍
-_PROBE_RUNNING = threading.Lock()
-_PROBE_TTL = float(os.environ.get("TV_PROBE_TTL", "600"))
-_PROBE_WORKERS = int(os.environ.get("TV_PROBE_WORKERS", "48"))
-_PROBE_TIMEOUT = float(os.environ.get("TV_PROBE_TIMEOUT", "4"))
-# 拉取全部 TV 源的总时限（秒）：全部源都不可达时不让 SSE 无限挂住。
-# 6 个源各最多 TV_TIMEOUT，所以默认取 6 × 15 = 90s 量级，保证慢网络下每个源都有机会。
-TV_SOURCES_DEADLINE = float(os.environ.get("TV_SOURCES_DEADLINE", "75"))
-
 
 def _cache_get(key, ttl):
     with _LOCK:
@@ -97,125 +54,8 @@ def _cache_put(key, val):
         _CACHE[key] = (time.time(), val)
 
 
-def probe_url(url, timeout=None):
-    """探测一个流地址是否存活，返回 (ok, latency_ms, cors)。
-
-    cors：响应是否带 Access-Control-Allow-Origin 头——HLS 在浏览器直连播放
-    必须有它（hls.js 用 fetch/XHR 拉取），没有则只能走服务器代理。
-    """
-    timeout = timeout or _PROBE_TIMEOUT
-    sess = _session()
-    t0 = time.time()
-    cors = False
-    try:
-        r = sess.get(
-            url,
-            headers={"User-Agent": UA_BROWSER, "Accept": "*/*"},
-            timeout=timeout,
-            stream=True,
-            allow_redirects=True,
-        )
-        acao = (r.headers.get("Access-Control-Allow-Origin") or "").strip()
-        cors = bool(acao)
-        try:
-            next(r.iter_content(512))
-        except Exception:
-            pass
-        r.close()
-        ok = r.status_code < 400
-    except Exception:
-        ok = False
-    return ok, int((time.time() - t0) * 1000), cors
-
-
-def probe_channels(channels, refresh=False):
-    """并发探测频道各备用源，返回 {url: {"ok":..,"ms":..}}。"""
-    gen = probe_channels_iter(channels, refresh=refresh)
-    live = None
-    try:
-        while True:
-            next(gen)
-    except StopIteration as e:
-        live = e.value
-    return live or {}
-
-
-def probe_channels_iter(channels, refresh=False):
-    """生成器版探测：yield (done, total) 汇报进度，return 存活映射。
-
-    探测对象：每个频道的全部备用地址（上限 MAX_URLS_PER_CHANNEL）+ http 地址的
-    https 升级变体（用于判断「能否浏览器直连」）。结果按 _PROBE_TTL 缓存。
-    用 _PROBE_RUNNING 串行化真正的探测：多人同时打开页面时，后来者会等前一轮跑完，
-    然后直接命中缓存秒出，不会把线程数放大成「用户数 × 48」。
-    """
-    urls = []
-    for c in channels:
-        for u in (c.get("urls") or [])[:MAX_URLS_PER_CHANNEL]:
-            urls.append(u)
-            if u.startswith("http://"):
-                urls.append("https://" + u[len("http://"):])
-    urls = list(dict.fromkeys(urls))
-    total = len(urls)
-    urlset = set(urls)
-
-    def _fresh():
-        now = time.time()
-        with _LOCK:
-            return {
-                u: {"ok": v[1], "ms": v[2], "cors": v[3]}
-                for u, v in _PROBE_CACHE.items()
-                if u in urlset and now - v[0] <= _PROBE_TTL
-            }
-
-    cached = _fresh()
-    todo = [u for u in urls if refresh or u not in cached]
-
-    if not todo:
-        yield (total, total)
-        return cached
-
-    done = 0
-    step = max(1, len(todo) // 40)          # 约汇报 40 次进度
-    with _PROBE_RUNNING:
-        # 拿到锁后可能已有别的请求跑完一轮，重新读缓存，避免重复探测
-        if not refresh:
-            cached = _fresh()
-            todo = [u for u in urls if u not in cached]
-            if not todo:
-                yield (total, total)
-                return cached
-        try:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-
-            with ThreadPoolExecutor(max_workers=_PROBE_WORKERS) as ex:
-                futs = {ex.submit(probe_url, u): u for u in todo}
-                for f in as_completed(futs):
-                    u = futs[f]
-                    try:
-                        ok, ms, cors = f.result()
-                    except Exception:
-                        ok, ms, cors = False, 0, False
-                    cached[u] = {"ok": ok, "ms": ms, "cors": cors}
-                    with _LOCK:
-                        _PROBE_CACHE[u] = (time.time(), ok, ms, cors)
-                    done += 1
-                    if done % step == 0 or done == len(todo):
-                        yield (done, len(todo))
-        except Exception:
-            for u in todo:
-                ok, ms, cors = probe_url(u)
-                cached[u] = {"ok": ok, "ms": ms, "cors": cors}
-                with _LOCK:
-                    _PROBE_CACHE[u] = (time.time(), ok, ms, cors)
-                done += 1
-                if done % step == 0 or done == len(todo):
-                    yield (done, len(todo))
-    return cached
-
-
 # ---- 网络（默认纯直连，忽略系统/环境代理） ----
-# 复用一个 Session：requests.Session 内部的 urllib3 连接池是线程安全的，
-# 复用后能避免「探测 2000+ 个地址就新建 2000+ 个连接」的性能灾难。
+# 复用一个 Session：requests.Session 内部的 urllib3 连接池是线程安全的。
 _SHARED_SESSION = None
 _SHARED_LOCK = threading.Lock()
 
@@ -264,7 +104,7 @@ def _to_http(url):
 def http_get(url, timeout=None, referer=None, as_json=False, retries=2):
     """GET 一个 URL；返回 (resp, None) 或 (None, 错误串)。直连，不走任何代理。
 
-    retries：公开直播列表偶发断连/限流，默认重试 1 次。
+    retries：公开接口偶发断连/限流，默认重试 1 次。
     """
     headers = {"User-Agent": UA_BROWSER, "Accept": "*/*"}
     if referer:
@@ -314,337 +154,10 @@ def http_get(url, timeout=None, referer=None, as_json=False, retries=2):
 
 
 # ---------------------------------------------------------------------------
-# m3u 解析
-# ---------------------------------------------------------------------------
-_EXTINF_RE = re.compile(r"#EXTINF:(.*)")
-_ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
-
-
-def _split_extinf(line):
-    """拆分 `#EXTINF:<时长> <属性>,<显示名>` → (属性串, 显示名)。
-
-    不能用简单的 `[^,]*` 切分：属性值里可能含逗号（如
-    tvg-logo="http://x/a,b.png"）。这里按「引号外的第一个逗号」切，
-    时长字段（可能为空/带空格/小数/负数）直接跳过。
-    """
-    body = line[len("#EXTINF:"):]
-    i = 0
-    while i < len(body) and (body[i].isdigit() or body[i] in "-.+ "):
-        i += 1
-    rest = body[i:]
-    inq = False
-    for j, ch in enumerate(rest):
-        if ch == '"':
-            inq = not inq
-        elif ch == "," and not inq:
-            return rest[:j], rest[j + 1:].strip()
-    return rest, ""
-
-
-def parse_m3u(text):
-    """解析 M3U/M3U8 播放列表 → [{name,url,logo,group}]
-
-    兼容 #EXTINF:-1 / #EXTINF:0 / #EXTINF:-1.5 / #EXTINF: 以及带空格的各种写法。
-    """
-    out = []
-    lines = text.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if line.startswith("#EXTINF"):
-            attrs = {}
-            name = ""
-            m = _EXTINF_RE.search(line)
-            if m:
-                attr_str, name = _split_extinf(line)
-                attrs = dict(_ATTR_RE.findall(attr_str))
-            url = ""
-            j = i + 1
-            while j < len(lines):
-                nxt = lines[j].strip()
-                if nxt and not nxt.startswith("#"):
-                    url = nxt
-                    break
-                j += 1
-            if url.startswith("http"):
-                out.append(
-                    {
-                        "name": name,
-                        "url": url,
-                        "logo": attrs.get("tvg-logo", ""),
-                        "group": (attrs.get("group-title", "") or "").strip(),
-                    }
-                )
-            i = j
-        i += 1
-    return out
-
-
-# 常见央视频道中文名
-_CCTV_NAMES = {
-    "cctv-1": "CCTV-1 综合",
-    "cctv-2": "CCTV-2 财经",
-    "cctv-3": "CCTV-3 综艺",
-    "cctv-4": "CCTV-4 中文国际",
-    "cctv-5": "CCTV-5 体育",
-    "cctv-5+": "CCTV-5+ 体育赛事",
-    "cctv-6": "CCTV-6 电影",
-    "cctv-7": "CCTV-7 国防军事",
-    "cctv-8": "CCTV-8 电视剧",
-    "cctv-9": "CCTV-9 纪录",
-    "cctv-10": "CCTV-10 科教",
-    "cctv-11": "CCTV-11 戏曲",
-    "cctv-12": "CCTV-12 社会与法",
-    "cctv-13": "CCTV-13 新闻",
-    "cctv-14": "CCTV-14 少儿",
-    "cctv-15": "CCTV-15 音乐",
-    "cctv-16": "CCTV-16 奥林匹克",
-    "cctv-17": "CCTV-17 农业农村",
-    "cctv-4k": "CCTV-4K 超高清",
-    "cctv-8k": "CCTV-8K 超高清",
-}
-
-_GROUP_CN = {
-    "news": "新闻",
-    "general": "综合",
-    "movies": "电影",
-    "series": "电视剧",
-    "sports": "体育",
-    "music": "音乐",
-    "kids": "少儿",
-    "animation": "动画",
-    "documentary": "纪录片",
-    "education": "科教",
-    "science": "科学",
-    "culture": "文化",
-    "entertainment": "综艺",
-    "lifestyle": "生活",
-    "travel": "旅游",
-    "business": "财经",
-    "family": "家庭",
-    "outdoor": "户外",
-    "weather": "天气",
-    "legislative": "政务",
-    "religious": "宗教",
-    "shop": "购物",
-    "health": "健康",
-    "comedy": "喜剧",
-    "classic": "经典",
-    "undefined": "其他",
-}
-
-# 国内源常用的中文分组，直接采用
-_CN_GROUPS = {
-    "央视频道", "卫视频道", "地方频道", "体育频道", "电影频道", "纪录频道",
-    "音乐频道", "儿童频道", "数字频道", "春晚频道", "解说频道", "直播中国",
-    "付费频道", "综艺频道", "新闻频道", "影视频道", "科教频道", "财经频道",
-    "生活频道", "旅游频道", "戏曲频道", "购物频道", "4K频道", "8K频道",
-}
-
-# 分组名与名称关键词的标签归并：避免「卫视 / 卫视频道」「央视 / 央视频道」这类
-# 同义标签同时出现（分组派生 vs 频道名派生各挂一个）
-_CAT_ALIAS = {
-    "央视频道": "央视", "卫视频道": "卫视", "地方频道": "地方",
-    "新闻频道": "新闻", "体育频道": "体育", "电影频道": "电影",
-    "纪录频道": "纪录片", "音乐频道": "音乐", "儿童频道": "少儿",
-    "科教频道": "科教", "财经频道": "财经", "戏曲频道": "戏曲",
-    "综艺频道": "综艺", "影视频道": "影视", "生活频道": "生活",
-    "旅游频道": "旅游", "购物频道": "购物",
-}
-_GROUP_SKIP = {"更新时间", "undefined", "general;travel"}
-
-_NAME_KW = [
-    (r"cctv|cgtn", "央视"),
-    (r"卫视", "卫视"),
-    (r"news|新闻", "新闻"),
-    (r"sport|体育|football|basketball|足球|篮球", "体育"),
-    (r"movie|film|cinema|theater|theatre|影视", "影视"),
-    (r"kids|children|少儿|动画", "少儿"),
-    (r"music|音乐", "音乐"),
-    (r"documentary|纪录|人文", "纪录片"),
-    (r"edu|科教|science|科学", "科教"),
-]
-
-
-def _slug(name):
-    return re.sub(r"\s+", " ", (name or "").strip()).lower()
-
-
-def tv_categories(name, group):
-    """由频道名与 m3u 分组推导中文分类标签（同义标签自动归并）。"""
-    cats = []
-    g = (group or "").strip()
-    if g in _GROUP_SKIP:
-        g = ""
-    if g:
-        if g in _CN_GROUPS:
-            cats.append(_CAT_ALIAS.get(g, g))
-        else:
-            for part in re.split(r"[;,]", g):
-                p = part.strip()
-                cn = _CAT_ALIAS.get(p) or _GROUP_CN.get(p.lower())
-                if cn and cn not in cats:
-                    cats.append(cn)
-    s = _slug(name)
-    for pat, cn in _NAME_KW:
-        if re.search(pat, s) and cn not in cats:
-            cats.append(cn)
-    if not cats:
-        cats = ["综合"]
-    return cats
-
-
-def _norm_tv_name(name):
-    """把不同来源的同一频道名归一化，用于跨源合并。
-
-    CCTV1 / CCTV-1 / CCTV-1 综合 / CCTV-1 HD (1080p) -> CCTV-1
-    湖南卫视 / 湖南卫视HD / 东方卫视4K -> 湖南卫视 / 东方卫视
-    """
-    n = (name or "").strip().upper()
-    n = re.sub(r"[\[（(][^\]）)]*[\]）)]", "", n)      # (1080p) [Geo-blocked]
-    n = re.sub(r"[\s\-_\.·]+", "", n)                 # CCTV - 1 -> CCTV1
-    m = re.match(r"^CCTV\+?(\d+[K\+]?)?", n)          # 央视：只取频道号
-    if m:
-        num = m.group(1) or ""
-        return "CCTV-" + num if num else "CCTV"
-    m = re.match(r"^(CGTN[A-Z]*)", n)                    # CGTN 国际台
-    if m:
-        return m.group(1)
-    n = re.sub(r"(?i)(HD|FHD|UHD|SD|4K|8K|1080P|720P|540P|576I)", "", n)
-    n = re.sub(r"(高清|超清|标清|蓝光|频道|直播|版)", "", n)
-    return n
-
-
-
-def _channel_key(name):
-    """先做中英文名归一，再做名称归一。"""
-    return _norm_tv_name(tv_display_name(name))
-
-
-def tv_display_name(name):
-    """把 CCTV-x 之类的英文名映射为中文名，未命中则原样返回。"""
-    s = _slug(name)
-    # CCTV1 / CCTV-1 / CCTV+ 1 / CCTV-4K / CCTV-5+ 都归一成 CCTV-x
-    m = re.match(r"cctv[\s\-]*\+?\s*(\d+\s*[k\+]?)?", s)
-    if m:
-        num = re.sub(r"\s+", "", m.group(1) or "")
-        if num:
-            key = "cctv-" + num.lower()
-            if key in _CCTV_NAMES:
-                return _CCTV_NAMES[key]
-            return "CCTV-" + num
-    if s.startswith("cetv"):
-        return name
-    if "beijing satellite tv" in s:
-        return "北京卫视"
-    if "anhui tv" in s:
-        return "安徽卫视"
-    if "dongfang tv" in s or "dragon tv" in s:
-        return "东方卫视"
-    if "zhejiang tv" in s:
-        return "浙江卫视"
-    if "hunan tv" in s:
-        return "湖南卫视"
-    if "jiangsu tv" in s:
-        return "江苏卫视"
-    if "shandong tv" in s:
-        return "山东卫视"
-    if "guangdong tv" in s:
-        return "广东卫视"
-    if "shenzhen tv" in s:
-        return "深圳卫视"
-    if "tianjin tv" in s:
-        return "天津卫视"
-    if "chongqing tv" in s:
-        return "重庆卫视"
-    if "liaoning tv" in s:
-        return "辽宁卫视"
-    if "heilongjiang tv" in s:
-        return "黑龙江卫视"
-    if "hubei tv" in s:
-        return "湖北卫视"
-    if "sichuan tv" in s:
-        return "四川卫视"
-    if "hebei tv" in s:
-        return "河北卫视"
-    if "henan tv" in s:
-        return "河南卫视"
-    if "fujian tv" in s:
-        return "东南卫视"
-    if "guangxi tv" in s:
-        return "广西卫视"
-    if "yunnan tv" in s:
-        return "云南卫视"
-    if "guizhou tv" in s:
-        return "贵州卫视"
-    if "shanxi tv" in s:
-        return "山西卫视"
-    if "shaanxi tv" in s:
-        return "陕西卫视"
-    if "gansu tv" in s:
-        return "甘肃卫视"
-    if "ningxia tv" in s:
-        return "宁夏卫视"
-    if "qinghai tv" in s:
-        return "青海卫视"
-    if "xinjiang tv" in s:
-        return "新疆卫视"
-    if "xizang tv" in s or "tibet" in s:
-        return "西藏卫视"
-    if "inner mongolia tv" in s:
-        return "内蒙古卫视"
-    if "jilin tv" in s:
-        return "吉林卫视"
-    if "jiangxi tv" in s:
-        return "江西卫视"
-    if "hainan tv" in s:
-        return "海南卫视"
-    return name
-
-
-def _clean_channel(name):
-    """去掉 (1080p) / [Geo-blocked] 之类的后缀噪音。"""
-    n = re.sub(r"\s*[\(\[][^)\]]*[\)\]]\s*$", "", name or "").strip()
-    return n or (name or "").strip()
-
-
-def _natkey(s):
-    """自然排序键：CCTV-2 排在 CCTV-10 前面。"""
-    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s or "")]
-
-
-# ---------------------------------------------------------------------------
-# 频道白名单：只保留「央视频道 + 省级卫视（每省/直辖市一个）」。
-# 全量聚合有 800+ 频道、数千个地址，打开页面逐个探测要等很久；
-# 白名单把频道收敛到 ~50 个，探测十几秒内完成。设环境变量 TV_FULL=1 恢复全量。
-# ---------------------------------------------------------------------------
-TV_FULL = os.environ.get("TV_FULL", "0") == "1"
-
-_TV_WHITELIST = set()
-for _k in _CCTV_NAMES:                    # cctv-1 … cctv-17 / 4k / 8k / 5+
-    _TV_WHITELIST.add("CCTV-" + _k.split("-", 1)[1].upper())
-_TV_WHITELIST.add("CGTN")                 # 央视国际（总台）
-for _n in (
-    # 直辖市
-    "北京卫视", "天津卫视", "上海→东方卫视", "重庆卫视",
-    # 省（含自治区的官方卫视名）
-    "河北卫视", "山西卫视", "内蒙古卫视", "辽宁卫视", "吉林卫视",
-    "黑龙江卫视", "东方卫视", "江苏卫视", "浙江卫视", "安徽卫视",
-    "东南卫视",                               # 福建（对外统一呼号）
-    "江西卫视", "山东卫视", "河南卫视", "湖北卫视", "湖南卫视",
-    "广东卫视", "广西卫视", "海南卫视", "四川卫视", "贵州卫视",
-    "云南卫视", "西藏卫视", "陕西卫视", "甘肃卫视",
-    "青海卫视", "宁夏卫视", "新疆卫视",
-):
-    if "→" not in _n:
-        _TV_WHITELIST.add(_n)
-
-
-# ---------------------------------------------------------------------------
 # 同源媒体代理（配合 app.py 的 /api/tv/media）
-# HTTPS 部署页面上，http 的 IPTV 源会被浏览器当混合内容拦截、HLS 还会被 CORS 拦。
-# 默认把播放地址包装成同源代理路径（TV_PROXY_MEDIA=0 可关闭，恢复浏览器直连）。
-# 探测仍走原始地址（服务端可达性），包装只在返回给前端时进行。
+# HTTPS 部署页面上，http 的媒体会被浏览器当混合内容拦截、HLS 还会被 CORS 拦。
+# 播放地址直连优先（https 升级），代理作为前端播放失败时的兜底
+# （TV_PROXY_MEDIA=0 可完全关闭 /api/tv/media 兜底）。
 # ---------------------------------------------------------------------------
 TV_PROXY_MEDIA = os.environ.get("TV_PROXY_MEDIA", "1").lower() not in ("0", "false", "no")
 
@@ -663,171 +176,6 @@ def unwrap_media_url(u):
         from urllib.parse import unquote as _uq
         return _uq(u.split("u=", 1)[1])
     return u
-
-
-def https_probe_key(u):
-    """http 地址的 https 升级变体（探测用）；非 http 返回 None。"""
-    return ("https://" + u[len("http://"):]) if u.startswith("http://") else None
-
-
-def compute_direct_flags(channels, live):
-    """标记每个频道能否「浏览器直连」播放。
-
-    判据：该频道存在一个 https（或可 https 升级）地址，探测存活且带 CORS 头。
-    直连 = 不经服务器、最流畅；没有直连条件的频道在云端 HTTPS 部署下只能走
-    服务器代理（前端会自动切换），跨洋中转时可能卡顿。
-    """
-    for c in channels:
-        ok_direct = False
-        for u in (c.get("urls") or [])[:MAX_URLS_PER_CHANNEL]:
-            if u.startswith("https://"):
-                if live.get(u, {}).get("ok") and live.get(u, {}).get("cors"):
-                    ok_direct = True
-                    break
-            else:
-                k = https_probe_key(u)
-                if k and live.get(k, {}).get("ok") and live.get(k, {}).get("cors"):
-                    ok_direct = True
-                    break
-        c["direct"] = ok_direct
-    return channels
-
-
-def _snapshot(payload):
-    """把缓存里的 payload 复制一份再返回。
-
-    get_channels 的调用方（探测逻辑）会往 channel 字典里写 live/best_url/latency_ms，
-    如果直接返回缓存对象，这些字段会永久污染缓存，之后不带 probe 的请求
-    （/api/tv/channels）就会拿到上一次探测的过期结果。
-    """
-    return {
-        **payload,
-        "channels": [dict(c) for c in payload["channels"]],
-    }
-
-
-def get_channels(force=False, probe=False, refresh=False):
-    """聚合所有 TV 源 → {ok, count, channels, sources, errors}
-
-    同一频道在不同源里会聚合到一起，urls 按源优先级排列（备用源），
-    播放端按顺序自动切换，避免单源失效就看不了。
-    probe=True 时附带每个源的存活探测结果；结果按频道名称自然排序。
-    """
-    key = "tv:channels"
-    payload = None if force else _cache_get(key, TV_CACHE_TTL)
-
-    if payload is None:
-        merged = {}     # key -> channel dict
-        order = []      # 保持首次出现顺序
-        errors = []
-        deadline = time.time() + TV_SOURCES_DEADLINE
-        for si, src in enumerate(TV_SOURCES):
-            # 给每个源分配「剩余预算」，避免第一个源超时重试把总时限吃光，
-            # 导致后面所有源都被跳过（曾出现 6 个源只试了 1 个就返回空）。
-            if si > 0:
-                remaining = deadline - time.time()
-                if remaining <= 1.0:
-                    errors.append(f"{src} → 已超过总时限 {TV_SOURCES_DEADLINE}s，跳过")
-                    continue
-            else:
-                remaining = TV_SOURCES_DEADLINE
-            # 公开源有 6 个，单个源超时时重试意义不大（不如快点试下一个），
-            # 所以这里不重试；http_get 内部仍保留 SSLError 的 http 降级。
-            resp, err = http_get(
-                src, timeout=min(TV_TIMEOUT, max(2.0, remaining)), retries=1
-            )
-            if err:
-                errors.append(f"{src} → {err}")
-                continue
-            for ch in parse_m3u(resp.text):
-                name = _clean_channel(ch["name"])
-                if not name or not ch["url"]:
-                    continue
-                disp = tv_display_name(name)
-                k = _channel_key(name)
-                if not k:
-                    continue
-                if k not in merged:
-                    merged[k] = {
-                        "name": disp,
-                        "raw_name": name,
-                        "logo": ch["logo"],
-                        "cats": tv_categories(name, ch["group"]),
-                        "urls": [],
-                    }
-                    order.append(k)
-                c = merged[k]
-                if ch["url"] not in c["urls"]:
-                    c["urls"].append(ch["url"])
-                if not c["logo"] and ch["logo"]:
-                    c["logo"] = ch["logo"]
-
-        # 白名单过滤：只保留央视 + 省级卫视（TV_FULL=1 关闭）
-        if not TV_FULL:
-            merged = {k: v for k, v in merged.items() if k in _TV_WHITELIST}
-            order = [k for k in order if k in _TV_WHITELIST]
-
-        channels = []
-        for k in order:
-            c = merged[k]
-            urls = c["urls"][:MAX_URLS_PER_CHANNEL]
-            # 卫视类显示名规范成白名单名（去掉源里的 4K/高清 等后缀噪音）；
-            # 央视保留 _CCTV_NAMES 的完整中文名（如「CCTV-1 综合」）
-            disp = c["name"]
-            if (
-                not TV_FULL and k in _TV_WHITELIST
-                and not k.startswith("CCTV") and not k.startswith("CGTN")
-            ):
-                disp = k
-            channels.append(
-                {
-                    "name": disp,
-                    "raw_name": c["raw_name"],
-                    "logo": c["logo"],
-                    "cats": c["cats"],
-                    "url": urls[0],                       # 主源
-                    "urls": urls,                         # 全部备用源（含主源）
-                    "backups": len(urls) - 1,
-                    "type": "hls"
-                    if urls[0].lower().split("?")[0].endswith(".m3u8")
-                    else "video",
-                }
-            )
-
-        # 按频道名自然排序（CCTV-2 在 CCTV-10 前）
-        channels.sort(key=lambda c: _natkey(c["name"]))
-        payload = {
-            "ok": bool(channels),
-            "count": len(channels),
-            "channels": channels,
-            "sources": TV_SOURCES,
-            "errors": errors,
-        }
-        # 只在拿到频道时才缓存。失败结果一旦进缓存，接下来半小时都会返回空列表
-        # （表现为「刷新几次才好」），而公开源抖动是常态，不值得缓存。
-        if channels:
-            _cache_put(key, payload)
-
-    # 返回快照，避免调用方写字段污染缓存
-    result = _snapshot(payload)
-
-    if probe:
-        live = probe_channels(result["channels"], refresh=refresh)
-        for c in result["channels"]:
-            best = None
-            for u in (c.get("urls") or [])[:MAX_URLS_PER_CHANNEL]:
-                st = live.get(u)
-                if not st:
-                    continue
-                if st["ok"] and (best is None or st["ms"] < best[1]):
-                    best = (u, st["ms"])
-            c["live"] = bool(best)
-            c["best_url"] = best[0] if best else c["url"]
-            c["latency_ms"] = best[1] if best else None
-        compute_direct_flags(result["channels"], live)
-        result["probed"] = True
-    return result
-
 
 
 # ---------------------------------------------------------------------------
@@ -1050,9 +398,8 @@ def _cctv_video(page_url):
     """从央视视频页取 guid，再取 mp4 地址。
 
     央视把长视频切成多个 chapter（分片）。以《新闻联播》完整版为例：30 分钟的节目
-    在接口里是 7 个 300 秒的切片。旧逻辑「取时长最长的分片当正片」会只播到第 1 片，
-    却把 totalLength（30 分钟）当成时长返回——表现为「列表显示 30 分钟，实际播 5 分钟」。
-    现在返回完整 playlist，由前端顺序连播，时长也用真实总长。
+    在接口里是多个切片。返回完整 playlist（各码率档），由前端顺序连播 + 清晰度切换，
+    时长也用真实总长。
 
     解析结果按页面 URL 缓存（TV_CACHE_TTL，默认 30 分钟）：央视接口对海外服务器
     响应较慢，重复点击同一期节目时直接命中缓存，秒出播放地址。
@@ -1068,6 +415,7 @@ def _cctv_video(page_url):
 
 
 def _cctv_video_uncached(page_url):
+    """从央视视频页取 guid，再取 mp4 地址（无缓存版）。"""
     resp, err = http_get(page_url, referer=page_url)
     if err:
         return {"ok": False, "error": f"页面获取失败：{err}"}
@@ -1203,14 +551,13 @@ def _btime_video(page_url, gid=""):
     if not variants:
         return {"ok": False, "error": "未找到可播放地址", "page": page_url}
     best = variants[-1]              # 默认最高码率（与旧行为一致）
-    s = {"stream_rate": best["bitrate"]}
     return {
         "ok": True,
         "url": best["playlist"][0]["url"],
         "type": "mp4",
         "title": "",
         "duration": dur,
-        "rate": s.get("stream_rate", ""),
+        "rate": best["bitrate"],
         "variants": variants,
         "quality": best["key"],
     }
