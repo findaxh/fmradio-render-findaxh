@@ -1052,10 +1052,8 @@ def _cctv_video(page_url):
         parts.append({"url": u, "duration": dur})
     if not parts:
         return {"ok": False, "error": "未找到可播放地址"}
-    # 播放统一走同源代理：HTTPS 页面无法播 http 媒体（混合内容），代理同时
-    # 解决 CORS 与 HTTP/HTTPS 混用问题，并支持 Range 拖动。
-    for p in parts:
-        p["url"] = wrap_media_url(p["url"])
+    # 直连优先：分片已是 https（上面升级），浏览器直连 cntv CDN 最流畅；
+    # 播放失败时由前端自动改走 /api/tv/media 代理兜底（见 programs.js）。
     # 时长合计（用接口给的 totalLength 兜底，缺失时用分片之和）
     total = 0.0
     for p in parts:

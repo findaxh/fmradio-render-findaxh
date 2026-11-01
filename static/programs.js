@@ -173,6 +173,7 @@ function fmtDur(sec) {
 // ---------- 分片连播（央视把长视频切成多个 chapter） ----------
 var playlist = [];        // [{url, duration}]
 var segIndex = 0;
+var segProxied = false;   // 直连失败后改走服务器代理兜底
 
 function playSegment(i) {
   if (i >= playlist.length) {
@@ -181,10 +182,13 @@ function playSegment(i) {
   }
   segIndex = i;
   var seg = playlist[i];
-  // HTTPS 页面无法播放 http 媒体（浏览器混合内容拦截），统一升级。
-  // 服务端已升级，这里兜底处理缓存里的旧数据或个别漏网页面。
+  // 直连优先（https 升级，绕过混合内容且不经服务器，最流畅）；
+  // 出错时 error 监听器会把 segProxied 置真并重放本段，改走同源代理兜底。
   var u = seg.url;
-  if (location.protocol === "https:" && u.indexOf("http://") === 0) {
+  if (segProxied) {
+    var raw = (u.indexOf("http") === 0) ? u : location.origin + u;
+    u = "/api/tv/media?u=" + encodeURIComponent(raw);
+  } else if (location.protocol === "https:" && u.indexOf("http://") === 0) {
     u = "https://" + u.slice(7);
   }
   video.src = u;
@@ -216,6 +220,7 @@ function playItem(it) {
   destroyHls();
   playlist = [];
   segIndex = 0;
+  segProxied = false;
 
   var q = "/api/tv/play?url=" + encodeURIComponent(it.url);
   if (it.gid) q += "&gid=" + encodeURIComponent(it.gid);
@@ -276,7 +281,16 @@ if (window.FMPlayer) {
 video.addEventListener("playing", () => setStatus("● 播放中"));
 video.addEventListener("waiting", () => setStatus("缓冲中…"));
 video.addEventListener("pause", () => setStatus("已暂停"));
-video.addEventListener("error", () => setStatus("播放出错，请重试或换一期"));
+video.addEventListener("error", () => {
+  // 连播中直连失败：自动改走服务器代理重试本段（混合内容/CORS/https 不通都覆盖）
+  if (playlist.length && segIndex < playlist.length && !segProxied) {
+    segProxied = true;
+    setStatus("直连失败，改用服务器代理…");
+    playSegment(segIndex);
+    return;
+  }
+  setStatus("播放出错，请重试或换一期");
+});
 
 // ---------- 键盘：上下期切换 ----------
 document.addEventListener("keydown", (e) => {

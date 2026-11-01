@@ -175,20 +175,52 @@ def programs_page():
 
 
 # ---------------- TV 频道（iptv-org 等公开 m3u 源） ----------------
-def _wrap_channels_payload(payload):
-    """返回给前端前，把频道播放地址包装成同源代理路径。
+def _media_candidates(u):
+    """单个原始地址 → 有序播放候选列表。
 
-    HTTPS 部署下，浏览器拦截 http 媒体（混合内容），HLS 还受 CORS 限制；
-    统一经 /api/tv/media 同源代理后两者都消失。探测始终走原始地址，
-    所以包装只在响应边界做，不影响 probe 缓存。
+    直连（https 升级）优先——浏览器直连源站不占服务器流量、不绕路，最流畅；
+    服务器代理兜底——直连被混合内容/CORS 拦截或 https 不通时自动切换（前端
+    播放失败会按 urls 顺序逐个尝试）。原 http 地址排最后：本地 HTTP 页面仍可直连。
+    """
+    out = []
+    if u.startswith("https://"):
+        out.append(u)
+    elif u.startswith("http://"):
+        out.append("https://" + u[len("http://"):])
+    out.append(tvmod.wrap_media_url(u))
+    if not u.startswith("https://"):
+        out.append(u)
+    return out
+
+
+def _wrap_channels_payload(payload):
+    """返回给前端前，把每个频道的 urls 展开成「直连优先、代理兜底」的候选列表。
+
+    探测始终针对原始地址在服务端进行，与这里的展开互不影响。
+    best_url（探测出的最快源）的候选排到最前。
     """
     if not getattr(tvmod, "TV_PROXY_MEDIA", False):
         return payload
     for c in payload.get("channels") or []:
-        c["url"] = tvmod.wrap_media_url(c.get("url") or "")
-        c["urls"] = [tvmod.wrap_media_url(u) for u in (c.get("urls") or [])]
+        raws = []
         if c.get("best_url"):
-            c["best_url"] = tvmod.wrap_media_url(c["best_url"])
+            raws.append(c["best_url"])
+        raws.append(c.get("url") or "")
+        raws += [u for u in (c.get("urls") or []) if u not in raws]
+        seen = set()
+        cands = []
+        for u in raws:
+            if not u:
+                continue
+            for x in _media_candidates(u):
+                if x not in seen:
+                    seen.add(x)
+                    cands.append(x)
+        if cands:
+            c["url"] = cands[0]
+            if c.get("best_url"):
+                c["best_url"] = cands[0]
+            c["urls"] = cands[:12]
     return payload
 
 
@@ -469,7 +501,7 @@ def healthz():
 
 # ---------------- 同源媒体代理（TV 直播 / 央视 mp4） ----------------
 _MEDIA_UA = USER_AGENT
-_MEDIA_TIMEOUT = (10, 30)          # (连接, 读取)
+_MEDIA_TIMEOUT = (10, 60)          # (连接, 读取)；跨洋回源较慢，读取放宽
 _M3U8_URI_TAGS = re.compile(
     r"#EXT-X-(?:KEY|MAP|MEDIA|SESSION-KEY|I-FRAME-STREAM-INF|PART-INF)"
 )
