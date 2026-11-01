@@ -478,8 +478,8 @@ def _cctv_video_uncached(page_url):
         v["total"] = sum(p["duration"] for p in v["playlist"])
     if not variants:
         return {"ok": False, "error": "未找到可播放地址"}
-    # 默认取中低档（带宽探测交给前端自动升档；直播失败也能在最差档兜底）
-    default = variants[min(1, len(variants) - 1)]
+    # 默认取最高档「超清 2M」；网络不佳时由前端自动降档兜底
+    default = variants[-1]
     parts = default["playlist"]
     # 直连优先：分片已是 https（上面升级），浏览器直连 cntv CDN 最流畅；
     # 播放失败时由前端自动改走 /api/tv/media 代理兜底（见 programs.js）。

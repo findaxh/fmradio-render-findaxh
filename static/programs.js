@@ -223,8 +223,9 @@ function renderQChips() {
 }
 
 function applyQMode() {
-  // 节目加载/续播时按 qMode 决定档位；手动档位越界时收敛到最高档
-  if (qMode === "auto") curVar = Math.min(1, variants.length - 1);
+  // 节目加载/续播时按 qMode 决定档位；自动模式默认从最高档「超清 2M」起播，
+  // 网络不佳时自动降档兜底；手动档位越界时收敛到最高档
+  if (qMode === "auto") curVar = variants.length - 1;
   else curVar = Math.max(0, Math.min(qMode, variants.length - 1));
 }
 
