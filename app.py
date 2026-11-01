@@ -278,6 +278,7 @@ def api_tv_channels_stream():
             c["live"] = bool(best)
             c["best_url"] = best[0] if best else c["url"]
             c["latency_ms"] = best[1] if best else None
+        tvmod.compute_direct_flags(payload["channels"], live)
         payload["probed"] = True
         yield _sse(dict(_wrap_channels_payload(payload), phase="done"))
 
@@ -474,6 +475,7 @@ def api_probe():
             status = resp.status_code
             ctype = resp.headers.get("Content-Type", "")
             loc = resp.headers.get("Location", "")
+            acao = (resp.headers.get("Access-Control-Allow-Origin") or "").strip()
             try:
                 next(resp.iter_content(1024))
             except Exception:
@@ -484,6 +486,7 @@ def api_probe():
                     "ok": status < 400,
                     "status": status,
                     "content_type": ctype,
+                    "cors": bool(acao),
                     # 3xx 时给出跳转目标，便于判断是不是 CDN 的正常跳转
                     "location": loc if 300 <= status < 400 else "",
                     "channel": cname,

@@ -98,10 +98,15 @@ def _cache_put(key, val):
 
 
 def probe_url(url, timeout=None):
-    """探测一个流地址是否存活，返回 (ok, latency_ms)。"""
+    """探测一个流地址是否存活，返回 (ok, latency_ms, cors)。
+
+    cors：响应是否带 Access-Control-Allow-Origin 头——HLS 在浏览器直连播放
+    必须有它（hls.js 用 fetch/XHR 拉取），没有则只能走服务器代理。
+    """
     timeout = timeout or _PROBE_TIMEOUT
     sess = _session()
     t0 = time.time()
+    cors = False
     try:
         r = sess.get(
             url,
@@ -110,6 +115,8 @@ def probe_url(url, timeout=None):
             stream=True,
             allow_redirects=True,
         )
+        acao = (r.headers.get("Access-Control-Allow-Origin") or "").strip()
+        cors = bool(acao)
         try:
             next(r.iter_content(512))
         except Exception:
@@ -118,7 +125,7 @@ def probe_url(url, timeout=None):
         ok = r.status_code < 400
     except Exception:
         ok = False
-    return ok, int((time.time() - t0) * 1000)
+    return ok, int((time.time() - t0) * 1000), cors
 
 
 def probe_channels(channels, refresh=False):
@@ -136,7 +143,8 @@ def probe_channels(channels, refresh=False):
 def probe_channels_iter(channels, refresh=False):
     """生成器版探测：yield (done, total) 汇报进度，return 存活映射。
 
-    只探测每个频道的全部备用地址（上限 MAX_URLS_PER_CHANNEL），结果按 _PROBE_TTL 缓存。
+    探测对象：每个频道的全部备用地址（上限 MAX_URLS_PER_CHANNEL）+ http 地址的
+    https 升级变体（用于判断「能否浏览器直连」）。结果按 _PROBE_TTL 缓存。
     用 _PROBE_RUNNING 串行化真正的探测：多人同时打开页面时，后来者会等前一轮跑完，
     然后直接命中缓存秒出，不会把线程数放大成「用户数 × 48」。
     """
@@ -144,6 +152,8 @@ def probe_channels_iter(channels, refresh=False):
     for c in channels:
         for u in (c.get("urls") or [])[:MAX_URLS_PER_CHANNEL]:
             urls.append(u)
+            if u.startswith("http://"):
+                urls.append("https://" + u[len("http://"):])
     urls = list(dict.fromkeys(urls))
     total = len(urls)
     urlset = set(urls)
@@ -152,7 +162,7 @@ def probe_channels_iter(channels, refresh=False):
         now = time.time()
         with _LOCK:
             return {
-                u: {"ok": v[1], "ms": v[2]}
+                u: {"ok": v[1], "ms": v[2], "cors": v[3]}
                 for u, v in _PROBE_CACHE.items()
                 if u in urlset and now - v[0] <= _PROBE_TTL
             }
@@ -182,21 +192,21 @@ def probe_channels_iter(channels, refresh=False):
                 for f in as_completed(futs):
                     u = futs[f]
                     try:
-                        ok, ms = f.result()
+                        ok, ms, cors = f.result()
                     except Exception:
-                        ok, ms = False, 0
-                    cached[u] = {"ok": ok, "ms": ms}
+                        ok, ms, cors = False, 0, False
+                    cached[u] = {"ok": ok, "ms": ms, "cors": cors}
                     with _LOCK:
-                        _PROBE_CACHE[u] = (time.time(), ok, ms)
+                        _PROBE_CACHE[u] = (time.time(), ok, ms, cors)
                     done += 1
                     if done % step == 0 or done == len(todo):
                         yield (done, len(todo))
         except Exception:
             for u in todo:
-                ok, ms = probe_url(u)
-                cached[u] = {"ok": ok, "ms": ms}
+                ok, ms, cors = probe_url(u)
+                cached[u] = {"ok": ok, "ms": ms, "cors": cors}
                 with _LOCK:
-                    _PROBE_CACHE[u] = (time.time(), ok, ms)
+                    _PROBE_CACHE[u] = (time.time(), ok, ms, cors)
                 done += 1
                 if done % step == 0 or done == len(todo):
                     yield (done, len(todo))
@@ -655,6 +665,34 @@ def unwrap_media_url(u):
     return u
 
 
+def https_probe_key(u):
+    """http 地址的 https 升级变体（探测用）；非 http 返回 None。"""
+    return ("https://" + u[len("http://"):]) if u.startswith("http://") else None
+
+
+def compute_direct_flags(channels, live):
+    """标记每个频道能否「浏览器直连」播放。
+
+    判据：该频道存在一个 https（或可 https 升级）地址，探测存活且带 CORS 头。
+    直连 = 不经服务器、最流畅；没有直连条件的频道在云端 HTTPS 部署下只能走
+    服务器代理（前端会自动切换），跨洋中转时可能卡顿。
+    """
+    for c in channels:
+        ok_direct = False
+        for u in (c.get("urls") or [])[:MAX_URLS_PER_CHANNEL]:
+            if u.startswith("https://"):
+                if live.get(u, {}).get("ok") and live.get(u, {}).get("cors"):
+                    ok_direct = True
+                    break
+            else:
+                k = https_probe_key(u)
+                if k and live.get(k, {}).get("ok") and live.get(k, {}).get("cors"):
+                    ok_direct = True
+                    break
+        c["direct"] = ok_direct
+    return channels
+
+
 def _snapshot(payload):
     """把缓存里的 payload 复制一份再返回。
 
@@ -786,6 +824,7 @@ def get_channels(force=False, probe=False, refresh=False):
             c["live"] = bool(best)
             c["best_url"] = best[0] if best else c["url"]
             c["latency_ms"] = best[1] if best else None
+        compute_direct_flags(result["channels"], live)
         result["probed"] = True
     return result
 

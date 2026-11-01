@@ -188,9 +188,16 @@ function renderList() {
     const sub = document.createElement("div");
     sub.className = "tsub";
     let txt = (ch.cats || []).slice(0, 2).join(" / ");
+    // 播放路径标注：⚡直连 = 有 https+CORS 源可浏览器直连（流畅）；
+    // ☁中转 = 仅 http 源，云端部署下必须经服务器代理（可能卡顿）
+    if (ch.direct === true) txt = "⚡直连 · " + txt;
+    else if (ch.direct === false) txt = "☁中转 · " + txt;
     if (ch.backups > 0) txt += (txt ? " · " : "") + ch.backups + " 备源";
     if (ch.latency_ms != null) txt += (txt ? " · " : "") + ch.latency_ms + "ms";
     sub.textContent = txt;
+    el.title = ch.direct === true
+      ? "该频道有 https 源，浏览器直连播放（不经服务器，流畅）"
+      : "该频道仅 http 源，云端部署时经服务器中转（可能卡顿；本地部署则不受影响）";
 
     el.appendChild(box);
     el.appendChild(nm);
@@ -304,7 +311,10 @@ function autoplayFallback(err) {
 
 video.addEventListener("playing", () => {
   const n = urlsOf(currentChannel).length;
-  setStatus("● 播放中" + (n > 1 ? " · 源 " + (urlIndex + 1) + "/" + n : ""));
+  const proxied = (urlsOf(currentChannel)[urlIndex] || "").indexOf("/api/tv/media") === 0;
+  setStatus("● 播放中" +
+    (n > 1 ? " · 源 " + (urlIndex + 1) + "/" + n : "") +
+    (proxied ? "（服务器中转）" : "（直连）"));
   renderList();
 });
 video.addEventListener("waiting", () => setStatus("缓冲中…"));
