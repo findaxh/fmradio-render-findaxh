@@ -1048,24 +1048,44 @@ def _cctv_video_uncached(page_url):
     if info is None:
         return {"ok": False, "error": f"视频信息获取失败：{last_err}"}
     video = info.get("video") or {}
-    chapters = video.get("chapters") or []
-    # 按 duration 排序后累加，过滤掉 0 时长占位片；取全部有地址的分片
-    parts = []
-    for c in chapters:
-        u = (c.get("url") or "").strip()
-        if not u:
+    # 央视每个节目有 4 档码率变体（chapters=418k / 2=818k / 3=1.2M / 4=2M），
+    # 全部解析出来交给前端做清晰度切换与自动升档
+    rank_labels = ["流畅", "标清", "高清", "超清", "蓝光"]
+    variants = []
+    for chs in (video.get("chapters"), video.get("chapters2"),
+                video.get("chapters3"), video.get("chapters4")):
+        parts = []
+        for c in chs or []:
+            u = (c.get("url") or "").strip()
+            if not u:
+                continue
+            # HTTPS 页面无法播放 http 媒体（混合内容拦截）。实测 vod.cntv.lxdns.com
+            # 的 https 端口正常，统一升级；播放失败时前端自动改走同源代理兜底。
+            if u.startswith("http://"):
+                u = "https://" + u[len("http://"):]
+            try:
+                dur = float(c.get("duration") or 0)
+            except (TypeError, ValueError):
+                dur = 0.0
+            parts.append({"url": u, "duration": dur})
+        if not parts:
             continue
-        # HTTPS 页面无法播放 http 媒体（混合内容拦截）。实测 vod.cntv.lxdns.com
-        # 的 https 端口正常，统一升级，保证云端 HTTPS 部署也能播。
-        if u.startswith("http://"):
-            u = "https://" + u[len("http://"):]
+        m = re.search(r"h264(\d+)", parts[0]["url"])
         try:
-            dur = float(c.get("duration") or 0)
-        except (TypeError, ValueError):
-            dur = 0.0
-        parts.append({"url": u, "duration": dur})
-    if not parts:
+            bitrate = int(m.group(1)) if m else 0
+        except ValueError:
+            bitrate = 0
+        variants.append({"bitrate": bitrate, "playlist": parts})
+    variants.sort(key=lambda v: v["bitrate"] or 0)
+    for i, v in enumerate(variants):
+        v["key"] = "q%d" % i
+        v["label"] = rank_labels[i] if i < len(rank_labels) else "档位%d" % (i + 1)
+        v["total"] = sum(p["duration"] for p in v["playlist"])
+    if not variants:
         return {"ok": False, "error": "未找到可播放地址"}
+    # 默认取中低档（带宽探测交给前端自动升档；直播失败也能在最差档兜底）
+    default = variants[min(1, len(variants) - 1)]
+    parts = default["playlist"]
     # 直连优先：分片已是 https（上面升级），浏览器直连 cntv CDN 最流畅；
     # 播放失败时由前端自动改走 /api/tv/media 代理兜底（见 programs.js）。
     # 时长合计（用接口给的 totalLength 兜底，缺失时用分片之和）
@@ -1084,8 +1104,10 @@ def _cctv_video_uncached(page_url):
         "type": "mp4",
         "title": info.get("title", ""),
         "duration": total,               # 真实总时长（秒）
-        "playlist": parts,               # 全部分片，前端顺序连播
+        "playlist": parts,               # 默认档分片（兼容旧字段）
         "segments": len(parts),
+        "variants": variants,            # 全部清晰度档位（前端切换/自动升档）
+        "quality": default["key"],
     }
 
 
@@ -1110,23 +1132,40 @@ def _btime_video(page_url, gid=""):
     streams = ((data.get("data") or {}).get("video_stream")) or []
     if not streams:
         return {"ok": False, "error": "未找到可播放地址", "page": page_url}
-    # 取码率最高的一路
-    best = None
+    # 多路码率 → 清晰度变体（前端切换/自动升档）
+    try:
+        dur = float((data.get("data") or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    variants = []
     for s in streams:
+        u = (s.get("stream_url") or "").strip()
+        if not u:
+            continue
         try:
             rate = float(s.get("stream_rate") or 0)
         except (TypeError, ValueError):
             rate = 0.0
-        if best is None or rate > best[0]:
-            best = (rate, s)
-    s = best[1]
+        variants.append({"bitrate": rate, "playlist": [{"url": u, "duration": dur}]})
+    variants.sort(key=lambda v: v["bitrate"] or 0)
+    rank_labels = ["流畅", "标清", "高清", "超清", "蓝光"]
+    for i, v in enumerate(variants):
+        v["key"] = "q%d" % i
+        v["label"] = rank_labels[i] if i < len(rank_labels) else "档位%d" % (i + 1)
+        v["total"] = dur
+    if not variants:
+        return {"ok": False, "error": "未找到可播放地址", "page": page_url}
+    best = variants[-1]              # 默认最高码率（与旧行为一致）
+    s = {"stream_rate": best["bitrate"]}
     return {
         "ok": True,
-        "url": s.get("stream_url", ""),
+        "url": best["playlist"][0]["url"],
         "type": "mp4",
-        "title": s.get("stream_vbt", ""),
-        "duration": (data.get("data") or {}).get("duration", ""),
+        "title": "",
+        "duration": dur,
         "rate": s.get("stream_rate", ""),
+        "variants": variants,
+        "quality": best["key"],
     }
 
 

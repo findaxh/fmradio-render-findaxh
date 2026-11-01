@@ -170,18 +170,103 @@ function fmtDur(sec) {
   return h > 0 ? h + ":" + p(m) + ":" + p(s) : m + ":" + p(s);
 }
 
-// ---------- 分片连播（央视把长视频切成多个 chapter） ----------
-var playlist = [];        // [{url, duration}]
-var segIndex = 0;
+// ---------- 清晰度变体 + 分片连播 ----------
+// variants: [{key,label,bitrate,playlist:[{url,duration}],total}]，按码率升序。
+// 央视各档分片数量不同（418k=7 段 / 1.2M=16 段），切档用全局时间戳对齐，
+// 保证切换/升降档后从同一进度继续播放。
+const qChipsEl = document.getElementById("qChips");
+var variants = [];        // 当前节目的全部清晰度档位
+var curVar = 0;           // 当前档位下标
+var qMode = "auto";       // "auto" 或手动锁定的档位下标（跨节目记忆）
+var upgradePending = false;
+var segIndex = 0;         // 当前档内的段下标
+var segOffset = 0;        // 段内起始偏移（切档续播用）
 var segProxied = false;   // 直连失败后改走服务器代理兜底
+var waitingStreak = 0;
 
-function playSegment(i) {
-  if (i >= playlist.length) {
-    setStatus("✓ 已播放完整内容（共 " + playlist.length + " 段）");
+function parts() { return (variants[curVar] && variants[curVar].playlist) || []; }
+function bufferedAhead() {
+  try {
+    if (video.buffered.length) return video.buffered.end(video.buffered.length - 1) - video.currentTime;
+  } catch (e) {}
+  return 0;
+}
+function fmtQ(b) {
+  b = Number(b) || 0;
+  if (!b) return "";
+  return b >= 1000000 ? (b / 1000000).toFixed(1).replace(/\.0$/, "") + "M" : Math.round(b / 1000) + "K";
+}
+
+function renderQChips() {
+  qChipsEl.innerHTML = "";
+  if (variants.length < 2) { qChipsEl.style.display = "none"; return; }
+  qChipsEl.style.display = "";
+  var mk = function (txt, title, active, fn) {
+    var el = document.createElement("div");
+    el.className = "chip" + (active ? " active" : "");
+    el.textContent = txt;
+    el.title = title;
+    el.onclick = fn;
+    qChipsEl.appendChild(el);
+  };
+  var cur = variants[curVar];
+  mk("自动 · " + cur.label, "根据缓冲自动升/降档（当前 " + cur.label + "）",
+    qMode === "auto", function () { qMode = "auto"; renderQChips(); });
+  variants.forEach(function (v, i) {
+    mk(v.label + (v.bitrate ? " " + fmtQ(v.bitrate) : ""), "手动锁定 " + v.label,
+      qMode === i, function () {
+        if (qMode === i) return;
+        qMode = i;
+        switchQuality(i);
+      });
+  });
+}
+
+function applyQMode() {
+  // 节目加载/续播时按 qMode 决定档位；手动档位越界时收敛到最高档
+  if (qMode === "auto") curVar = Math.min(1, variants.length - 1);
+  else curVar = Math.max(0, Math.min(qMode, variants.length - 1));
+}
+
+function switchQuality(idx) {
+  if (idx < 0 || idx >= variants.length || idx === curVar) return;
+  var T = globalTime();
+  curVar = idx;
+  segProxied = false;
+  renderQChips();
+  playAtGlobal(T);
+}
+
+function globalTime() {
+  var t = 0, ps = parts();
+  for (var i = 0; i < segIndex && i < ps.length; i++) t += (ps[i].duration || 0);
+  return t + (video.currentTime || 0);
+}
+
+function playAtGlobal(T) {
+  var ps = parts(), acc = 0, idx = ps.length - 1, off = 0;
+  for (var i = 0; i < ps.length; i++) {
+    var d = ps[i].duration || 0;
+    if (T < acc + d) { idx = i; off = T - acc; break; }
+    acc += d;
+  }
+  if (off < 0) off = 0;
+  if (idx === ps.length - 1 && off >= (ps[idx].duration || 0)) {
+    setStatus("✓ 已播放完整内容（共 " + ps.length + " 段）");
+    return;
+  }
+  playSegment(idx, off);
+}
+
+function playSegment(i, offset) {
+  var ps = parts();
+  if (i >= ps.length) {
+    setStatus("✓ 已播放完整内容（共 " + ps.length + " 段）");
     return;
   }
   segIndex = i;
-  var seg = playlist[i];
+  segOffset = offset || 0;
+  var seg = ps[i];
   // 直连优先（https 升级，绕过混合内容且不经服务器，最流畅）；
   // 出错时 error 监听器会把 segProxied 置真并重放本段，改走同源代理兜底。
   var u = seg.url;
@@ -194,19 +279,23 @@ function playSegment(i) {
   video.src = u;
   var p = video.play();
   if (p && p.catch) p.catch(function () { setStatus("请点击播放器中的播放按钮"); });
-  if (playlist.length > 1) {
-    setStatus("● 播放中 · 第 " + (i + 1) + "/" + playlist.length + " 段" +
+  if (segOffset > 0.5) {
+    var seek = function () {
+      try { video.currentTime = segOffset; } catch (e) {}
+      video.removeEventListener("loadedmetadata", seek);
+    };
+    video.addEventListener("loadedmetadata", seek);
+    try { if (video.readyState >= 1) video.currentTime = segOffset; } catch (e) {}
+  }
+  var v = variants[curVar];
+  var qtxt = v ? (v.label + (v.bitrate ? " " + fmtQ(v.bitrate) + "bps" : "")) : "";
+  if (ps.length > 1) {
+    setStatus("● 播放中 · 第 " + (i + 1) + "/" + ps.length + " 段 · " + qtxt +
       (seg.duration ? "（" + fmtDur(seg.duration) + "）" : ""));
   } else {
-    setStatus("● 播放中");
+    setStatus("● 播放中 · " + qtxt);
   }
 }
-
-video.addEventListener("ended", function () {
-  if (playlist.length > 1 && segIndex + 1 < playlist.length) {
-    playSegment(segIndex + 1);          // 自动接下一段，直到整片播完
-  }
-});
 
 function playItem(it) {
   currentItem = it;
@@ -218,9 +307,11 @@ function playItem(it) {
   setStatus("正在解析播放地址…");
   renderList();
   destroyHls();
-  playlist = [];
   segIndex = 0;
+  segOffset = 0;
   segProxied = false;
+  upgradePending = false;
+  waitingStreak = 0;
 
   var q = "/api/tv/play?url=" + encodeURIComponent(it.url);
   if (it.gid) q += "&gid=" + encodeURIComponent(it.gid);
@@ -233,11 +324,16 @@ function playItem(it) {
         window.open(it.url, "_blank", "noopener");
         return;
       }
-      // 央视返回分片列表时顺序连播；北京新闻是单个 mp4
-      if (d.playlist && d.playlist.length) {
-        playlist = d.playlist.filter(function (s) { return s && s.url; });
-      }
-      if (!playlist.length) playlist = [{ url: d.url, duration: Number(d.duration) || 0 }];
+      // 清晰度变体：服务端已按码率升序；老接口无 variants 时兜底单档
+      variants = (d.variants && d.variants.length)
+        ? d.variants
+        : [{ key: "q0", label: "默认", bitrate: Number(d.rate) || 0,
+             playlist: (d.playlist && d.playlist.length
+               ? d.playlist
+               : [{ url: d.url, duration: Number(d.duration) || 0 }]) }];
+      applyQMode();
+      renderQChips();
+      var ps = parts();
 
       var meta = {
         title: it.title,
@@ -251,7 +347,7 @@ function playItem(it) {
       // nowStatus 交给 playSegment 独占，否则「已就绪」会覆盖「播放中·第 x/n 段」。
       var extra = "";
       if (d.duration) extra = fmtDur(d.duration);
-      if (playlist.length > 1) extra += (extra ? " · " : "") + "共 " + playlist.length + " 段连播";
+      if (ps.length > 1) extra += (extra ? " · " : "") + "共 " + ps.length + " 段连播";
       if (d.rate) extra += (extra ? " · " : "") + d.rate + "kbps";
       if (extra) nowMeta.textContent = (it.date || "") + (extra ? " · " + extra : "");
 
@@ -278,19 +374,67 @@ if (window.FMPlayer) {
   });
 }
 
-video.addEventListener("playing", () => setStatus("● 播放中"));
-video.addEventListener("waiting", () => setStatus("缓冲中…"));
+video.addEventListener("playing", () => {
+  waitingStreak = 0;
+  setStatus("● 播放中");
+});
+video.addEventListener("timeupdate", () => {
+  if (!autoQReady()) return;
+  var ahead = bufferedAhead();
+  // 缓冲领先 40s 以上 → 下一段边界升档；掉到 10s 以内取消升档
+  if (ahead > 40 && curVar < variants.length - 1) upgradePending = true;
+  if (ahead < 10) upgradePending = false;
+});
+video.addEventListener("waiting", () => {
+  setStatus("缓冲中…");
+  if (!autoQReady()) return;
+  waitingStreak++;
+  // 一段内连续卡 2 次且缓冲所剩无几 → 立即降档续播（进度不丢）
+  if (waitingStreak >= 2 && curVar > 0 && bufferedAhead() < 6) {
+    waitingStreak = 0;
+    var downLabel = variants[curVar - 1].label;
+    switchQuality(curVar - 1);
+    setStatus("网络波动，自动降到 " + downLabel + "，从原进度继续");
+  }
+});
 video.addEventListener("pause", () => setStatus("已暂停"));
+video.addEventListener("ended", () => {
+  var T = globalTime() + 0.05;      // 下一段起点（换档后段数不同，用全局时间对齐）
+  if (autoQReady() && upgradePending && curVar < variants.length - 1) {
+    curVar++;
+    upgradePending = false;
+    segProxied = false;
+    renderQChips();
+    setStatus("网络良好，自动升到 " + variants[curVar].label);
+  } else {
+    segProxied = false;
+  }
+  var ps = parts(), acc = 0, idx = -1, off = 0;
+  for (var i = 0; i < ps.length; i++) {
+    var d = ps[i].duration || 0;
+    if (T < acc + d) { idx = i; off = T - acc; break; }
+    acc += d;
+  }
+  if (idx < 0) {
+    setStatus("✓ 已播放完整内容（共 " + ps.length + " 段）");
+    return;
+  }
+  playSegment(idx, off);
+});
 video.addEventListener("error", () => {
   // 连播中直连失败：自动改走服务器代理重试本段（混合内容/CORS/https 不通都覆盖）
-  if (playlist.length && segIndex < playlist.length && !segProxied) {
+  if (parts().length && segIndex < parts().length && !segProxied) {
     segProxied = true;
     setStatus("直连失败，改用服务器代理…");
-    playSegment(segIndex);
+    playSegment(segIndex, segOffset);
     return;
   }
   setStatus("播放出错，请重试或换一期");
 });
+
+function autoQReady() {
+  return qMode === "auto" && variants.length > 1 && !video.paused && video.readyState > 0;
+}
 
 // ---------- 键盘：上下期切换 ----------
 document.addEventListener("keydown", (e) => {

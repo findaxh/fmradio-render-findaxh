@@ -229,6 +229,8 @@ body { display: flex; flex-direction: column; min-height: 100vh; }
 .station:hover .block-x { opacity: .85; }
 .station .block-x:hover { color: #e5484d; background: var(--panel-2); }
 .now-status-row { display: flex; align-items: center; gap: 8px; margin-top: 2px; }
+.q-chips { margin: 8px 0 2px; }
+.q-chips .chip { font-size: 12px; padding: 3px 12px; }
 .block-btn {
   border: 1px solid var(--border);
   background: transparent;
