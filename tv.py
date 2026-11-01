@@ -1014,7 +1014,21 @@ def _cctv_video(page_url):
     在接口里是 7 个 300 秒的切片。旧逻辑「取时长最长的分片当正片」会只播到第 1 片，
     却把 totalLength（30 分钟）当成时长返回——表现为「列表显示 30 分钟，实际播 5 分钟」。
     现在返回完整 playlist，由前端顺序连播，时长也用真实总长。
+
+    解析结果按页面 URL 缓存（TV_CACHE_TTL，默认 30 分钟）：央视接口对海外服务器
+    响应较慢，重复点击同一期节目时直接命中缓存，秒出播放地址。
     """
+    key = "tv:resolve:" + page_url
+    hit = _cache_get(key, TV_CACHE_TTL)
+    if hit is not None:
+        return hit
+    result = _cctv_video_uncached(page_url)
+    if result.get("ok"):
+        _cache_put(key, result)
+    return result
+
+
+def _cctv_video_uncached(page_url):
     resp, err = http_get(page_url, referer=page_url)
     if err:
         return {"ok": False, "error": f"页面获取失败：{err}"}
