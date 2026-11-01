@@ -112,7 +112,7 @@ PORT=9000 ./run.sh                                       # 改端口
 - **生产 WSGI**：Render 上用 `gunicorn`（gthread worker）运行，SSE 流式接口（`/api/tv/channels/stream`）依赖 gthread 的线程并发，不能换 sync worker。
 - **免费档休眠**：free plan 15 分钟无流量会休眠，首次唤醒约需 30–50 秒；升级 starter 可常驻。
 - **磁盘为临时盘**：重启后文件系统清空；本项目缓存全在内存，无影响。
-- **混合内容（重要）**：Render 页面是 HTTPS，而部分电台/电视源是 `http://`。浏览器会拦截 HTTPS 页面里的 http 媒体，这类源在云端部署时可能无法播放（本地 HTTP 访问则不受影响）。属于公网 HTTPS 部署的固有限制。
+- **混合内容与 CORS（已解决）**：Render 页面是 HTTPS，而多数电视/央视源是 `http://`，浏览器会拦截；HLS 源还常缺 CORS 头。现由 `/api/tv/media` 同源媒体代理统一解决（见下方「配置」表的 `TV_PROXY_MEDIA`）。电台播放仍为浏览器直连，失效台可用屏蔽功能隐藏。
 - 出站网络：Render 服务器在海外，访问 Radio Browser / GitHub 源列表很通畅；国内服务器的 gh-proxy 超时问题不存在。
 
 ### 通过 frp 公网访问（可选，本地不部署也可以正常使用）/ Public access via frp (optional)
@@ -173,6 +173,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now fmradio
 | 超时 / 缓存 | `RB_TIMEOUT`（默认 8s）、`RB_DEADLINE`（每通道时限 30s）、`RB_CACHE_TTL`（结果缓存 300s） |
 | TV 频道源 | `TV_SOURCES`，逗号分隔，默认 6 个源（Collect-IPTV 每 4 小时自动测活优选 + gh-proxy 镜像、vbskycn 6 小时拨测、peterhchina 两个、iptv-org）。同一频道跨源合并为多个备用源，不可达的源自动跳过 |
 | 频道白名单 | 默认只保留**央视 + 省级卫视**（每省/直辖市一个，共 ~48 个），探测耗时从分钟级降到十几秒；设 `TV_FULL=1` 恢复全量 |
+| 媒体代理 | `TV_PROXY_MEDIA`（默认 1）：TV/央视播放统一走同源代理 `/api/tv/media`，解决 HTTPS 页面播放 http 源（混合内容拦截）与 HLS CORS 拦截，支持 Range 拖动与 m3u8 嵌套重写；设 `0` 恢复浏览器直连（省服务器流量） |
 | TV/节目缓存 | `TV_TIMEOUT`（默认 15s）、`TV_CACHE_TTL`（默认 1800s）、`TV_SOURCES_DEADLINE`（拉取全部源的总时限，默认 45s） |
 | 死链检测 | `TV_PROBE_TTL`（600s）、`TV_PROBE_WORKERS`（48）、`TV_PROBE_TIMEOUT`（4s）、`TV_MAX_URLS`（每频道最多备用源 6）；打开页面自动全量探测，`↻ 刷新可用频道` 按钮强制重测 |
 | 联播往期天数 | `XWLB_DAYS`（默认 30） |

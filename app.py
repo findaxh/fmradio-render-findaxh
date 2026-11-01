@@ -10,6 +10,7 @@ FM 网络电台 Web 服务（直连模式）
 """
 import json
 import os
+import re
 import threading
 import time
 import urllib.parse
@@ -174,12 +175,29 @@ def programs_page():
 
 
 # ---------------- TV 频道（iptv-org 等公开 m3u 源） ----------------
+def _wrap_channels_payload(payload):
+    """返回给前端前，把频道播放地址包装成同源代理路径。
+
+    HTTPS 部署下，浏览器拦截 http 媒体（混合内容），HLS 还受 CORS 限制；
+    统一经 /api/tv/media 同源代理后两者都消失。探测始终走原始地址，
+    所以包装只在响应边界做，不影响 probe 缓存。
+    """
+    if not getattr(tvmod, "TV_PROXY_MEDIA", False):
+        return payload
+    for c in payload.get("channels") or []:
+        c["url"] = tvmod.wrap_media_url(c.get("url") or "")
+        c["urls"] = [tvmod.wrap_media_url(u) for u in (c.get("urls") or [])]
+        if c.get("best_url"):
+            c["best_url"] = tvmod.wrap_media_url(c["best_url"])
+    return payload
+
+
 @app.route("/api/tv/channels")
 def api_tv_channels():
     probe = request.args.get("probe", "") in ("1", "true", "yes")
     refresh = request.args.get("refresh", "") in ("1", "true", "yes")
     data = tvmod.get_channels(probe=probe, refresh=refresh)
-    return jsonify(data)
+    return jsonify(_wrap_channels_payload(data))
 
 
 @app.route("/api/tv/channels/stream")
@@ -229,7 +247,7 @@ def api_tv_channels_stream():
             c["best_url"] = best[0] if best else c["url"]
             c["latency_ms"] = best[1] if best else None
         payload["probed"] = True
-        yield _sse(dict(payload, phase="done"))
+        yield _sse(dict(_wrap_channels_payload(payload), phase="done"))
 
     return Response(gen(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -397,6 +415,8 @@ def api_radiobrowser():
 def api_probe():
     """探测服务器到电台源站的可达性，用于排查死链。"""
     raw = request.args.get("url", "")
+    # 频道页拿到的是代理包装地址，还原成原始地址再探测
+    raw = tvmod.unwrap_media_url(raw)
     url = safe_url(raw)
     if not url:
         return jsonify({"ok": False, "error": "invalid or blocked url"}), 400
@@ -445,6 +465,135 @@ def api_probe():
 @app.route("/healthz")
 def healthz():
     return jsonify({"status": "ok", "proxy_mode": RB_PROXY_MODE})
+
+
+# ---------------- 同源媒体代理（TV 直播 / 央视 mp4） ----------------
+_MEDIA_UA = USER_AGENT
+_MEDIA_TIMEOUT = (10, 30)          # (连接, 读取)
+_M3U8_URI_TAGS = re.compile(
+    r"#EXT-X-(?:KEY|MAP|MEDIA|SESSION-KEY|I-FRAME-STREAM-INF|PART-INF)"
+)
+
+
+def _media_fetch(url, range_header=None):
+    """带重定向逐跳 SSRF 校验的流式 GET。返回最终 resp；被拦截/失败返回 (None, err)。"""
+    sess = DIRECT_SESSION
+    cur = url
+    for _ in range(6):
+        if safe_url(cur) is None:
+            return None, "redirect blocked"
+        try:
+            hdrs = {
+                "User-Agent": _MEDIA_UA, "Accept": "*/*",
+                "Referer": urllib.parse.urlparse(cur).scheme + "://"
+                           + (urllib.parse.urlparse(cur).hostname or "") + "/",
+            }
+            if range_header:
+                hdrs["Range"] = range_header
+            resp = sess.get(
+                cur, stream=True, timeout=_MEDIA_TIMEOUT, allow_redirects=False,
+                headers=hdrs,
+            )
+        except Exception as e:
+            return None, f"{type(e).__name__}: {e}"
+        if 300 <= resp.status_code < 400 and resp.headers.get("Location"):
+            loc = urllib.parse.urljoin(cur, resp.headers["Location"])
+            resp.close()
+            cur = loc
+            continue
+        return resp, None
+    return None, "too many redirects"
+
+
+def _proxy_url(u, base):
+    """m3u8 里的 URI → 同源代理路径（urljoin 兼容相对/绝对地址）。"""
+    absu = urllib.parse.urljoin(base, u)
+    return "/api/tv/media?u=" + urllib.parse.quote(absu, safe="")
+
+
+def _rewrite_m3u8(text, base):
+    """重写 m3u8 内所有 URI（分片/子播放列表/密钥），嵌套也走代理。"""
+    out = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("#"):
+            if _M3U8_URI_TAGS.match(s):
+                s = re.sub(
+                    r'URI="([^"]*)"',
+                    lambda m: 'URI="%s"' % _proxy_url(m.group(1), base),
+                    s,
+                )
+            out.append(s)
+        else:
+            out.append(_proxy_url(s, base))
+    return "\n".join(out) + "\n"
+
+
+def _proxy_stream(upstream, chunk=64 * 1024):
+    try:
+        while True:
+            piece = upstream.raw.read(chunk)
+            if not piece:
+                break
+            yield piece
+    finally:
+        try:
+            upstream.close()
+        except Exception:
+            pass
+
+
+@app.route("/api/tv/media")
+def api_tv_media():
+    """同源流媒体代理。
+
+    - mp4/TS：Range 透传，支持拖动；
+    - m3u8：manifest 内 URI 全部重写为代理路径（相对路径按上游最终 URL 解析），
+      分片请求继续打回本代理；
+    - 重定向逐跳过 safe_url（SSRF 防护），禁止跳内网。
+    """
+    url = safe_url(request.args.get("u", ""))
+    if not url:
+        return jsonify({"ok": False, "error": "invalid or blocked url"}), 400
+    resp, err = _media_fetch(url, range_header=request.headers.get("Range"))
+    if err or resp is None:
+        return jsonify({"ok": False, "error": err or "fetch failed"}), 502
+
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    final_url = resp.url
+    is_m3u8 = "mpegurl" in ctype or final_url.lower().split("?")[0].endswith(".m3u8") \
+        or url.lower().split("?")[0].endswith(".m3u8")
+    if is_m3u8:
+        try:
+            raw = resp.content
+        finally:
+            resp.close()
+        # 上游可能给 GBK 编码的 m3u8，统一转 utf-8
+        if raw[:3] == b"\xef\xbb\xbf":
+            raw = raw[3:]
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("gb18030", "ignore")
+        return Response(
+            _rewrite_m3u8(text, final_url),
+            mimetype="application/vnd.apple.mpegurl",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        )
+
+    passthrough = {}
+    for k in ("Content-Type", "Content-Length", "Content-Range",
+              "Accept-Ranges", "Last-Modified", "ETag"):
+        if k in resp.headers:
+            passthrough[k] = resp.headers[k]
+    passthrough.setdefault("Accept-Ranges", "bytes")
+    return Response(
+        _proxy_stream(resp),
+        status=resp.status_code,
+        headers=passthrough,
+    )
 
 
 if __name__ == "__main__":

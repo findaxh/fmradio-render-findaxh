@@ -42,6 +42,9 @@ TV_SOURCES = [
                 "https://peterhchina.github.io/iptv/CNTV-V4.m3u",
                 "https://peterhchina.github.io/iptv/CCTV-V4.m3u",
                 "https://iptv-org.github.io/iptv/countries/cn.m3u",
+                # fanmingming/live：每日更新的直连源（海外可达，域名双保险）
+                "https://live.fanmingming.com/tv/m3u/global.m3u",
+                "https://live.fanmingming.cn/tv/m3u/global.m3u",
             ]
         ),
     ).split(",")
@@ -427,6 +430,17 @@ _CN_GROUPS = {
     "付费频道", "综艺频道", "新闻频道", "影视频道", "科教频道", "财经频道",
     "生活频道", "旅游频道", "戏曲频道", "购物频道", "4K频道", "8K频道",
 }
+
+# 分组名与名称关键词的标签归并：避免「卫视 / 卫视频道」「央视 / 央视频道」这类
+# 同义标签同时出现（分组派生 vs 频道名派生各挂一个）
+_CAT_ALIAS = {
+    "央视频道": "央视", "卫视频道": "卫视", "地方频道": "地方",
+    "新闻频道": "新闻", "体育频道": "体育", "电影频道": "电影",
+    "纪录频道": "纪录片", "音乐频道": "音乐", "儿童频道": "少儿",
+    "科教频道": "科教", "财经频道": "财经", "戏曲频道": "戏曲",
+    "综艺频道": "综艺", "影视频道": "影视", "生活频道": "生活",
+    "旅游频道": "旅游", "购物频道": "购物",
+}
 _GROUP_SKIP = {"更新时间", "undefined", "general;travel"}
 
 _NAME_KW = [
@@ -447,17 +461,18 @@ def _slug(name):
 
 
 def tv_categories(name, group):
-    """由频道名与 m3u 分组推导中文分类标签。"""
+    """由频道名与 m3u 分组推导中文分类标签（同义标签自动归并）。"""
     cats = []
     g = (group or "").strip()
     if g in _GROUP_SKIP:
         g = ""
     if g:
         if g in _CN_GROUPS:
-            cats.append(g)
+            cats.append(_CAT_ALIAS.get(g, g))
         else:
             for part in re.split(r"[;,]", g):
-                cn = _GROUP_CN.get(part.strip().lower())
+                p = part.strip()
+                cn = _CAT_ALIAS.get(p) or _GROUP_CN.get(p.lower())
                 if cn and cn not in cats:
                     cats.append(cn)
     s = _slug(name)
@@ -613,6 +628,31 @@ for _n in (
 ):
     if "→" not in _n:
         _TV_WHITELIST.add(_n)
+
+
+# ---------------------------------------------------------------------------
+# 同源媒体代理（配合 app.py 的 /api/tv/media）
+# HTTPS 部署页面上，http 的 IPTV 源会被浏览器当混合内容拦截、HLS 还会被 CORS 拦。
+# 默认把播放地址包装成同源代理路径（TV_PROXY_MEDIA=0 可关闭，恢复浏览器直连）。
+# 探测仍走原始地址（服务端可达性），包装只在返回给前端时进行。
+# ---------------------------------------------------------------------------
+TV_PROXY_MEDIA = os.environ.get("TV_PROXY_MEDIA", "1").lower() not in ("0", "false", "no")
+
+
+def wrap_media_url(u):
+    """把原始流地址包装成 /api/tv/media 代理路径；已是相对路径则原样返回。"""
+    if not TV_PROXY_MEDIA or not u or u.startswith("/"):
+        return u
+    from urllib.parse import quote as _q
+    return "/api/tv/media?u=" + _q(u, safe="")
+
+
+def unwrap_media_url(u):
+    """还原代理路径里的原始地址（/api/probe 等需要原始地址的场景）。"""
+    if u and u.startswith("/api/tv/media?u="):
+        from urllib.parse import unquote as _uq
+        return _uq(u.split("u=", 1)[1])
+    return u
 
 
 def _snapshot(payload):
@@ -1012,6 +1052,10 @@ def _cctv_video(page_url):
         parts.append({"url": u, "duration": dur})
     if not parts:
         return {"ok": False, "error": "未找到可播放地址"}
+    # 播放统一走同源代理：HTTPS 页面无法播 http 媒体（混合内容），代理同时
+    # 解决 CORS 与 HTTP/HTTPS 混用问题，并支持 Range 拖动。
+    for p in parts:
+        p["url"] = wrap_media_url(p["url"])
     # 时长合计（用接口给的 totalLength 兜底，缺失时用分片之和）
     total = 0.0
     for p in parts:
