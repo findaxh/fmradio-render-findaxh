@@ -271,7 +271,10 @@ function playSegment(i, offset) {
   // 出错时 error 监听器会把 segProxied 置真并重放本段，改走同源代理兜底。
   var u = seg.url;
   if (segProxied) {
-    var raw = (u.indexOf("http") === 0) ? u : location.origin + u;
+    // 兜底代理用服务端解析到的原始地址（seg.purl，海外解析时为 cdn20 国际 CDN，
+    // Render 可直接访问）；国内域名 lxdns 交给浏览器直连
+    var raw = seg.purl || u;
+    raw = (raw.indexOf("http") === 0) ? raw : location.origin + raw;
     u = "/api/tv/media?u=" + encodeURIComponent(raw);
   } else if (location.protocol === "https:" && u.indexOf("http://") === 0) {
     u = "https://" + u.slice(7);

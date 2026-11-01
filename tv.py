@@ -1063,11 +1063,19 @@ def _cctv_video_uncached(page_url):
             # 的 https 端口正常，统一升级；播放失败时前端自动改走同源代理兜底。
             if u.startswith("http://"):
                 u = "https://" + u[len("http://"):]
+            # 央视按请求者 IP 返回 CDN：海外解析拿到 vod.cntv.cdn20.com（国际 CDN），
+            # 该域名对国内 IP 返回 403，浏览器直连必失败、只能走代理导致卡顿。
+            # 同路径在 vod.cntv.lxdns.com（国内 CDN）可直接访问——统一换成国内域名，
+            # purl 保留原始地址供代理兜底（Render 所在网络可访问 cdn20）。
+            purl = u
+            m_host = re.match(r"(https?://)([^/]+)(/.*)", u)
+            if m_host and m_host.group(2).lower() == "vod.cntv.cdn20.com":
+                u = m_host.group(1) + "vod.cntv.lxdns.com" + m_host.group(3)
             try:
                 dur = float(c.get("duration") or 0)
             except (TypeError, ValueError):
                 dur = 0.0
-            parts.append({"url": u, "duration": dur})
+            parts.append({"url": u, "duration": dur, "purl": purl})
         if not parts:
             continue
         m = re.search(r"h264(\d+)", parts[0]["url"])
