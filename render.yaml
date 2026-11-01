@@ -1,0 +1,33 @@
+# Render Blueprint — 一键部署
+# 文档: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: fm-radio
+    runtime: python
+    plan: free                    # 免费档；可改 starter/standard
+    buildCommand: pip install -r requirements.txt
+    # gthread worker：SSE(/api/tv/channels/stream) 需要并发流式响应，
+    # sync worker 会串行阻塞，必须用 gthread
+    startCommand: >-
+      gunicorn app:app
+      --bind 0.0.0.0:$PORT
+      --worker-class gthread
+      --workers 2
+      --threads 16
+      --timeout 120
+      --graceful-timeout 30
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: PORT               # Render 自动注入，这里仅声明默认值
+        value: 10000
+      - key: RB_PROXY_MODE
+        value: direct
+      - key: RB_CACHE_TTL
+        value: "300"
+      - key: TV_CACHE_TTL
+        value: "1800"
+      - key: XWLB_DAYS
+        value: "30"
